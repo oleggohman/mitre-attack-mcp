@@ -85,3 +85,52 @@ async def test_objects_after_timestamp_can_include_revoked(tool):
         "2018-01-01T00:00:00Z", include_description=False, remove_revoked_deprecated=False
     )
     assert [i for i in _object_ids(res) if _is_revoked_or_deprecated(i)] != []
+
+
+# --- alias lookups -----------------------------------------------------------
+# "Night Dragon" is only an alias of revoked G0014; "Darkmoon" matches revoked
+# S0209 and current S0012.
+
+
+async def test_groups_by_alias_excludes_revoked_by_default():
+    res = await server.get_groups_by_alias("Night Dragon")
+    assert res["count"] == 0
+
+
+async def test_groups_by_alias_can_include_revoked():
+    res = await server.get_groups_by_alias("Night Dragon", remove_revoked_deprecated=False)
+    assert [g["attack_id"] for g in res["groups"]] == ["G0014"]
+
+
+async def test_software_by_alias_excludes_revoked_by_default():
+    res = await server.get_software_by_alias("Darkmoon")
+    assert _stale_ids(res["software"]) == []
+    assert [s["attack_id"] for s in res["software"]] == ["S0012"]
+
+
+async def test_campaigns_by_alias_accepts_filter_flag():
+    res = await server.get_campaigns_by_alias(
+        "Operation Dream Job", remove_revoked_deprecated=False
+    )
+    assert res["count"] >= 1
+
+
+# --- format_objects ------------------------------------------------------------
+
+
+def test_format_objects_includes_attack_id():
+    objs = server.get_attack_data("enterprise").get_objects_by_name("Phishing", "attack-pattern")
+    text = server.format_objects(objs)
+    assert "ID: T1566" in text
+
+
+def test_format_objects_handles_plain_dicts():
+    obj = {
+        "id": "attack-pattern--a62a8db3-f23a-4d8f-afd6-9dbc77e7813b",
+        "name": "Phishing",
+        "description": "desc",
+    }
+    text = server.format_objects([obj], include_description=True)
+    assert "Name: Phishing" in text
+    assert "STIX ID: attack-pattern--a62a8db3-f23a-4d8f-afd6-9dbc77e7813b" in text
+    assert "Description: desc" in text

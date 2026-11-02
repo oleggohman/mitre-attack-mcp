@@ -251,6 +251,14 @@ def _compute_data_stats() -> Dict[str, Any]:
 
     return stats
 
+def _field(obj: Any, key: str, default: Any = None) -> Any:
+    """Read a field from a STIX object or a plain dict (both are mappings)."""
+    try:
+        return obj.get(key, default)
+    except AttributeError:
+        return getattr(obj, key, default)
+
+
 def format_objects(
     objects: List[Any],
     include_description: bool = False,
@@ -279,35 +287,35 @@ def format_objects(
         lines = []
 
         # Name --------------------------------------------------------------
-        name = getattr(obj, "name", None)
+        name = _field(obj, "name")
         if name:
             lines.append(f"Name: {name}")
 
         # External ATT&CK ID (e.g., T1059, G0032) ---------------------------
         try:
-            external_id = attack_data.get_attack_id(obj)
+            external_id = attack_data.get_attack_id(_field(obj, "id"))
             if external_id:
                 lines.append(f"ID: {external_id}")
         except Exception:
             pass  # not all objects map cleanly
 
         # STIX ID -----------------------------------------------------------
-        stix_id = getattr(obj, "id", None)
+        stix_id = _field(obj, "id")
         if stix_id:
             lines.append(f"STIX ID: {stix_id}")
 
         # Source reference (relationships only) -----------------------------
-        source_ref = getattr(obj, "source_ref", None)
+        source_ref = _field(obj, "source_ref")
         if source_ref:
             lines.append(f"Source Reference: {source_ref}")
 
         # Aliases -----------------------------------------------------------
-        aliases = getattr(obj, "aliases", None)
+        aliases = _field(obj, "aliases")
         if aliases:
             lines.append(f"Aliases: {aliases}")
 
         # Description -------------------------------------------------------
-        description = getattr(obj, "description", None)
+        description = _field(obj, "description")
         if include_description and description:
             lines.append(f"Description: {description}")
 
@@ -2015,6 +2023,7 @@ async def get_groups_by_alias(
     alias: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
     Get APT groups (intrusion sets) matching a given alias.
@@ -2029,6 +2038,7 @@ async def get_groups_by_alias(
         alias: Alias to search for (e.g., "Cozy Bear", "NOBELIUM").
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include group descriptions.
+        remove_revoked_deprecated: Exclude revoked/deprecated objects (default True).
 
     Returns:
         {
@@ -2051,6 +2061,8 @@ async def get_groups_by_alias(
 
     try:
         raw_groups = attack_data.get_groups_by_alias(alias)
+        if remove_revoked_deprecated:
+            raw_groups = attack_data.remove_revoked_deprecated(raw_groups)
     except Exception:
         raw_groups = []
 
@@ -2627,6 +2639,7 @@ async def get_campaigns_by_alias(
     alias: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
     Get campaigns by their alias.
@@ -2638,6 +2651,7 @@ async def get_campaigns_by_alias(
         alias: Campaign alias or alternate name (case-insensitive)
         domain: ATT&CK domain ("enterprise", "ics", etc.)
         include_description: Include campaign descriptions in output
+        remove_revoked_deprecated: Exclude revoked/deprecated objects (default True).
 
     Returns:
         {
@@ -2661,6 +2675,8 @@ async def get_campaigns_by_alias(
     # Retrieve matching campaigns
     try:
         campaigns = attack_data.get_campaigns_by_alias(alias) or []
+        if remove_revoked_deprecated:
+            campaigns = attack_data.remove_revoked_deprecated(campaigns)
     except Exception:
         campaigns = []
 
@@ -3487,6 +3503,7 @@ async def get_software_by_alias(
     alias: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
     Find software/malware by alias (e.g., 'Beacon', 'Mimilib').
@@ -3498,6 +3515,7 @@ async def get_software_by_alias(
         alias: Alias to search for.
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to include description fields.
+        remove_revoked_deprecated: Exclude revoked/deprecated objects (default True).
 
     Returns:
         {
@@ -3523,6 +3541,8 @@ async def get_software_by_alias(
     # Query the underlying library
     try:
         results = attack_data.get_software_by_alias(alias)
+        if remove_revoked_deprecated:
+            results = attack_data.remove_revoked_deprecated(results)
     except Exception:
         results = []
 

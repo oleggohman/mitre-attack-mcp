@@ -4,6 +4,8 @@
 // Preferred: uvx installs the Python dependencies declared in the bundled
 // pyproject.toml into an isolated environment and runs the server.
 // Fallback: a system python3/python that already has the dependencies installed.
+// Only a missing command (ENOENT) moves on to the next candidate; a launcher that
+// starts and then fails exits with its own code, so its error stays visible.
 
 const { spawn } = require('child_process');
 const path = require('path');
