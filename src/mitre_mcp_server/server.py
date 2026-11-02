@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
 import os
 import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-from mitreattack import download_stix, release_info
 from mcp.server.mcpserver import MCPServer
-
-from mitre_mcp_server import __version__
+from mitreattack import download_stix, release_info
 from mitreattack.stix20 import MitreAttackData
 
-
+from mitre_mcp_server import __version__
 
 # ---------------------------------------------------------------------------
 # Configuration & shared constants
@@ -1125,12 +1123,6 @@ async def get_group_by_name(
     except Exception:
         pass
 
-    formatted = format_objects(
-        [match],
-        include_description=include_description,
-        domain=domain,
-    )
-
     return {
         "found": True,
         "group": {
@@ -1140,7 +1132,6 @@ async def get_group_by_name(
             "stix_id": stix_id,
             "description": description,
         },
-        # "formatted": formatted,
         "message": f"Found intrusion set matching '{group_name}' in domain '{domain}'.",
     }
 
@@ -6848,7 +6839,6 @@ async def get_techniques_mitigated_by_mitigation(
     }
 
 
-from typing import Any, Dict, List, Optional
 
 @mcp.tool()
 async def get_mitigations_mitigating_technique(
@@ -6923,7 +6913,7 @@ async def get_mitigations_mitigating_technique(
         """
         # RelationshipEntry object with attribute `.object`
         if hasattr(entry, "object"):
-            return getattr(entry, "object")
+            return entry.object
 
         # Dict-like wrapper
         if isinstance(entry, dict):
@@ -7306,11 +7296,8 @@ async def get_techniques_detected_by_datacomponent(
         dc_obj = None
 
     datacomponent_info: Optional[Dict[str, Any]] = None
-    dc_for_format: Optional[Any] = None
 
     if dc_obj is not None:
-        dc_for_format = dc_obj
-
         if isinstance(dc_obj, dict):
             dc_name = dc_obj.get("name")
             dc_desc = dc_obj.get("description") if include_description else None
@@ -8326,6 +8313,7 @@ async def generate_layer(
         }
     """
     import re
+
     from mitreattack.navlayers import UsageLayerGenerator
 
     # Validate ATT&CK ID format: must be Gxxx/Mxxx/Sxxx/Dxxx
@@ -8520,7 +8508,7 @@ def main() -> None:
     import sys
     
     # Log to stderr (visible in Claude Desktop logs)
-    print(f"MITRE MCP Server starting...", file=sys.stderr)
+    print("MITRE MCP Server starting...", file=sys.stderr)
     print(f"Data directory: {DATA_DIR}", file=sys.stderr)
     
     # Check if we need to download
