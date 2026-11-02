@@ -6,3 +6,5 @@ __pycache__/
 .pytest_cache/
 uv.lock
 .mitre-mcp-server/
+.boost/
+.claude/

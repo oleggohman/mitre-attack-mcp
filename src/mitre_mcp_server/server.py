@@ -6,7 +6,9 @@ import os
 import sys
 
 from mitreattack import download_stix, release_info
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+
+from mitre_mcp_server import __version__
 from mitreattack.stix20 import MitreAttackData
 
 
@@ -320,7 +322,7 @@ def format_objects(
 # MCP server & first tool
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("mitre-attack-mcp-server")
+mcp = MCPServer("mitre-attack-mcp-server", version=__version__)
 
 
 @mcp.tool()
@@ -8513,7 +8515,7 @@ def main() -> None:
     Entrypoint for the mitre-mcp-server executable.
 
     - Ensures STIX data is downloaded for all domains (if not already).
-    - Starts the FastMCP server so tools (like get_data_stats) can be used.
+    - Starts the MCP server over stdio so tools (like get_data_stats) can be used.
     """
     import sys
     
@@ -8537,8 +8539,8 @@ def main() -> None:
     
     print("Server ready!", file=sys.stderr)
     
-    # Start the MCP server (FastMCP handles stdio / CLI integration)
-    mcp.run()
+    # Start the MCP server over stdio (mcp 2.x requires an explicit transport)
+    mcp.run(transport="stdio")
 
 if __name__ == "__main__":
     main()
