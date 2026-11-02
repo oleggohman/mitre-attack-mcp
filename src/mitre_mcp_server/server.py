@@ -572,6 +572,7 @@ async def get_objects_by_name(
     stix_type: str,
     domain: str = "enterprise",
     include_description: bool = False,
+    remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
     Retrieve MITRE ATT&CK objects by exact name match (case-sensitive).
@@ -593,6 +594,8 @@ async def get_objects_by_name(
         domain: ATT&CK domain ("enterprise", "mobile", or "ics").
         include_description: Whether to include descriptions in the formatted output
                              and structured result.
+        remove_revoked_deprecated: Exclude revoked/deprecated objects (default True).
+                                   Set False to resolve legacy names such as T1522.
 
     Returns:
         {
@@ -615,6 +618,9 @@ async def get_objects_by_name(
 
     try:
         objs = attack_data.get_objects_by_name(name, stix_type)
+        # The library has no filter flag for name lookups; apply its helper instead.
+        if remove_revoked_deprecated:
+            objs = attack_data.remove_revoked_deprecated(objs)
     except Exception:
         objs = []
 
@@ -686,6 +692,7 @@ async def get_objects_by_content(
     object_type: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
     Search MITRE ATT&CK objects by matching text inside their description field.
@@ -710,6 +717,7 @@ async def get_objects_by_content(
             - etc.
         domain: ATT&CK domain ("enterprise", "mobile", "ics").
         include_description: Whether to return descriptions in the structured output.
+        remove_revoked_deprecated: Exclude revoked/deprecated objects (default True).
 
     Returns:
         {
@@ -732,7 +740,11 @@ async def get_objects_by_content(
 
     # Perform text search
     try:
-        objs = attack_data.get_objects_by_content(content, object_type)
+        objs = attack_data.get_objects_by_content(
+            content,
+            object_type,
+            remove_revoked_deprecated=remove_revoked_deprecated,
+        )
     except Exception:
         objs = []
 
@@ -6400,15 +6412,18 @@ async def get_techniques_by_platform(
     platform: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK techniques that apply to a specific platform.
 
     Args:
-        platform: Platform name (e.g., 'Windows', 'Linux', 'macOS', 
-                  'Cloud', 'Azure AD', 'Network', etc.)
+        platform: Platform name as used in x_mitre_platforms (case-sensitive), e.g.
+                  'Windows', 'Linux', 'macOS', 'IaaS', 'SaaS', 'Identity Provider',
+                  'Office Suite', 'Containers', 'ESXi', 'Network Devices'.
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
         include_description: Whether to include technique descriptions.
+        remove_revoked_deprecated: Exclude revoked/deprecated techniques (default True).
 
     Returns:
         {
@@ -6430,7 +6445,10 @@ async def get_techniques_by_platform(
     attack_data = get_attack_data(domain)
 
     try:
-        techniques = attack_data.get_techniques_by_platform(platform)
+        techniques = attack_data.get_techniques_by_platform(
+            platform,
+            remove_revoked_deprecated=remove_revoked_deprecated,
+        )
     except Exception:
         techniques = []
 
@@ -8013,12 +8031,14 @@ async def get_objects_created_after(
     timestamp: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK objects created after a specific timestamp.
 
     Useful for detecting new additions to the framework.
     Timestamp must be ISO8601 format, e.g., '2024-01-01T00:00:00Z'.
+    Revoked/deprecated objects are excluded unless remove_revoked_deprecated=False.
 
     Returns:
         {
@@ -8042,7 +8062,9 @@ async def get_objects_created_after(
 
     # Try to fetch objects
     try:
-        objects = attack_data.get_objects_created_after(timestamp) or []
+        objects = attack_data.get_objects_created_after(
+            timestamp, remove_revoked_deprecated=remove_revoked_deprecated
+        ) or []
     except Exception as e:
         return {
             "found": False,
@@ -8066,17 +8088,17 @@ async def get_objects_created_after(
     for obj in objects:
         attack_id = None
         try:
-            attack_id = attack_data.get_attack_id(obj.id)
+            attack_id = attack_data.get_attack_id(obj["id"])
         except Exception:
             pass
 
         results.append(
             {
                 "id": attack_id,
-                "name": getattr(obj, "name", None),
-                "stix_id": obj.id,
-                "type": getattr(obj, "type", None),
-                "description": getattr(obj, "description", None)
+                "name": obj.get("name"),
+                "stix_id": obj["id"],
+                "type": obj.get("type"),
+                "description": obj.get("description")
                 if include_description
                 else None,
             }
@@ -8098,12 +8120,14 @@ async def get_objects_modified_after(
     timestamp: str,
     domain: str = "enterprise",
     include_description: bool = True,
+    remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK objects modified after a specific timestamp.
 
     Useful for tracking updates and changes to the ATT&CK framework.
     Timestamp must be ISO8601 format, e.g., '2024-01-01T00:00:00Z'.
+    Revoked/deprecated objects are excluded unless remove_revoked_deprecated=False.
 
     Returns:
         {
@@ -8127,7 +8151,9 @@ async def get_objects_modified_after(
 
     # Try to fetch objects
     try:
-        objects = attack_data.get_objects_modified_after(timestamp) or []
+        objects = attack_data.get_objects_modified_after(
+            timestamp, remove_revoked_deprecated=remove_revoked_deprecated
+        ) or []
     except Exception as e:
         return {
             "found": False,
@@ -8150,17 +8176,17 @@ async def get_objects_modified_after(
     results: list[Dict[str, Any]] = []
     for obj in objects:
         try:
-            attack_id = attack_data.get_attack_id(obj.id)
+            attack_id = attack_data.get_attack_id(obj["id"])
         except Exception:
             attack_id = None
 
         results.append(
             {
                 "id": attack_id,
-                "name": getattr(obj, "name", None),
-                "stix_id": getattr(obj, "id", None),
-                "type": getattr(obj, "type", None),
-                "description": getattr(obj, "description", None)
+                "name": obj.get("name"),
+                "stix_id": obj["id"],
+                "type": obj.get("type"),
+                "description": obj.get("description")
                 if include_description
                 else None,
             }
