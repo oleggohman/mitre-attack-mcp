@@ -78,8 +78,8 @@ The server logs to stderr only, because stdout carries the MCP stream.
 
 ## Known limitations
 
-- Since ATT&CK v18, data-component-to-technique detection mappings were replaced by detection strategies and analytics. `get_datacomponents_detecting_technique` and `get_techniques_detected_by_datacomponent` can therefore return empty results on current releases.
-- The first-start download needs network access to the ATT&CK data source (see [First start downloads data](#first-start-downloads-data)).
+- ATT&CK v18 replaced data-component-to-technique detection mappings with detection strategies and analytics. On v18 and later (including v20.0, the current download), `get_datacomponents_detecting_technique` and `get_techniques_detected_by_datacomponent` return empty results. They work only with pre-v18 data.
+- The first start needs network access to download the ATT&CK STIX data (see [First start downloads data](#first-start-downloads-data)).
 
 ## Tools
 
