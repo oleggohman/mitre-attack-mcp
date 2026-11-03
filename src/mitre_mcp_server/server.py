@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
+import tempfile
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from mcp.server.mcpserver import MCPServer
 from mitreattack import download_stix, release_info
 from mitreattack.stix20 import MitreAttackData
+from stix2 import Filter
+from stix2.exceptions import InvalidValueError
 
 from mitre_mcp_server import __version__
 
@@ -16,7 +21,16 @@ from mitre_mcp_server import __version__
 # ---------------------------------------------------------------------------
 
 # Domains we support
-DOMAINS: List[str] = ["enterprise", "mobile", "ics"]
+DOMAINS: List[str] = ["enterprise", "mobile", "ics", "atlas"]
+
+# MITRE ATLAS is not part of mitreattack.release_info, so it has its own pin.
+# To bump: update ATLAS_VERSION and ATLAS_SHA256 (SHA-256 of dist/stix-atlas.json at that tag).
+ATLAS_VERSION = "1.16.0"
+ATLAS_SHA256 = "a1bd782257de3c8591797ac863aa9b37fe4ae42ef9284bee98bfc2661fdd1c06"
+ATLAS_URL = (
+    "https://raw.githubusercontent.com/mitre-atlas/atlas-navigator-data/"
+    f"v{ATLAS_VERSION}/dist/stix-atlas.json"
+)
 
 APP_NAME = "mitre-mcp-server"
 
@@ -35,6 +49,8 @@ def get_version_dir() -> Path:
 
 def get_stix_path(domain: str) -> Path:
     """Return the expected STIX JSON path for a given domain."""
+    if domain == "atlas":
+        return DATA_DIR / f"atlas-v{ATLAS_VERSION}" / "stix-atlas.json"
     domain_key = f"{domain}-attack"
     return get_version_dir() / f"{domain_key}.json"
 
@@ -58,11 +74,36 @@ def check_existing_data() -> List[str]:
     return existing_domains
 
 
+def _download_atlas(stix_path: Path) -> None:
+    """Download the pinned ATLAS bundle, verify its SHA-256 and store it atomically."""
+    with urllib.request.urlopen(ATLAS_URL, timeout=60) as resp:  # noqa: S310 - fixed https URL
+        content = resp.read()
+
+    digest = hashlib.sha256(content).hexdigest()
+    if digest != ATLAS_SHA256:
+        raise RuntimeError(
+            f"ATLAS bundle hash mismatch: expected {ATLAS_SHA256}, got {digest}"
+        )
+
+    stix_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=stix_path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content)
+        os.replace(tmp_name, stix_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def download_domain_data(domain: str, force: bool = False) -> Tuple[str, Path]:
     """Download STIX data for a specific domain.
 
     Args:
-        domain: Domain name ('enterprise', 'mobile', or 'ics')
+        domain: Domain name ('enterprise', 'mobile', 'ics', or 'atlas')
         force: If True, download even if file already exists.
 
     Returns:
@@ -79,6 +120,12 @@ def download_domain_data(domain: str, force: bool = False) -> Tuple[str, Path]:
 
     # If file already exists and we're not forcing, just return it
     if stix_path.exists() and not force:
+        return (domain, stix_path)
+
+    if domain == "atlas":
+        _download_atlas(stix_path)
+        if not stix_path.exists():
+            raise RuntimeError(f"Download completed but file not found at {stix_path}")
         return (domain, stix_path)
 
     # Get expected hash and version info
@@ -122,9 +169,9 @@ def download_all_domains(force: bool = False) -> List[Tuple[str, Path]]:
         try:
             domain_data = download_domain_data(domain, force=force)
             downloaded_files.append(domain_data)
-        except Exception:
-            # You can add logging here later if you want
-            pass
+        except Exception as e:
+            # One failing domain (e.g. ATLAS offline) must not block the others.
+            print(f"Warning: Could not download {domain} domain: {e}", file=sys.stderr)
 
     return downloaded_files
 
@@ -139,12 +186,84 @@ attack_data: Dict[str, MitreAttackData] = {}
 _loaded_domains: List[str] = []
 
 
+class _MitreData(MitreAttackData):
+    """MitreAttackData with fallbacks that make ATLAS bundles usable.
+
+    ATLAS uses UUIDv5 STIX IDs and "mitre-atlas" references, which the upstream library
+    rejects for custom objects (tactics, matrices) and for attack-id lookups. Every override
+    first defers to the library and only falls back on the specific ATLAS failure, so
+    ATT&CK behaviour is unchanged.
+    """
+
+    _ID_SOURCES = ("mitre-attack", "mitre-atlas")
+
+    def get_objects_by_type(self, stix_type, remove_revoked_deprecated=False):
+        try:
+            return super().get_objects_by_type(stix_type, remove_revoked_deprecated)
+        except InvalidValueError:
+            objects = self.src.query([Filter("type", "=", stix_type)])
+            if remove_revoked_deprecated:
+                objects = self.remove_revoked_deprecated(objects)
+            return list(objects)
+
+    def get_object_by_stix_id(self, stix_id):
+        try:
+            return super().get_object_by_stix_id(stix_id)
+        except InvalidValueError:
+            return self.src.get(stix_id)
+
+    def get_object_by_attack_id(self, attack_id, stix_type):
+        try:
+            return super().get_object_by_attack_id(attack_id, stix_type)
+        except InvalidValueError:
+            found = self.src.query(
+                [
+                    Filter("external_references.external_id", "=", attack_id.upper()),
+                    Filter("type", "=", stix_type),
+                ]
+            )
+            return found[0] if found else None
+
+    def get_objects_by_name(self, name, stix_type):
+        try:
+            return super().get_objects_by_name(name, stix_type)
+        except InvalidValueError:
+            return list(
+                self.src.query([Filter("type", "=", stix_type), Filter("name", "=", name)])
+            )
+
+    def get_attack_id(self, stix_id):
+        obj = self.get_object_by_stix_id(stix_id)
+        refs = self.get_field(obj, "external_references", [])
+        if refs:
+            first = refs[0]
+            if first.get("external_id") and first.get("source_name") in self._ID_SOURCES:
+                return first["external_id"]
+        return None
+
+    def get_techniques_by_tactic(self, tactic_shortname, domain, remove_revoked_deprecated=False):
+        if domain != "atlas-attack":
+            return super().get_techniques_by_tactic(
+                tactic_shortname, domain, remove_revoked_deprecated
+            )
+        techniques = self.src.query(
+            [
+                Filter("type", "=", "attack-pattern"),
+                Filter("kill_chain_phases.phase_name", "=", tactic_shortname),
+                Filter("kill_chain_phases.kill_chain_name", "=", "mitre-atlas"),
+            ]
+        )
+        if remove_revoked_deprecated:
+            techniques = self.remove_revoked_deprecated(techniques)
+        return techniques
+
+
 def load_domain(domain: str) -> bool:
     """
     Load STIX data for a specific domain into memory.
 
     Args:
-        domain: Domain name ('enterprise', 'mobile', or 'ics')
+        domain: Domain name ('enterprise', 'mobile', 'ics', or 'atlas')
 
     Returns:
         True if loaded successfully, False otherwise.
@@ -172,7 +291,7 @@ def load_domain(domain: str) -> bool:
         )
 
     try:
-        attack_data[domain_key] = MitreAttackData(str(stix_path))
+        attack_data[domain_key] = _MitreData(str(stix_path))
         if domain not in _loaded_domains:
             _loaded_domains.append(domain)
         return True
@@ -239,7 +358,7 @@ def _compute_data_stats() -> Dict[str, Any]:
                 "exists": True,
                 "path": str(stix_path),
                 "size_mb": round(file_size_mb, 2),
-                "version": release_info.LATEST_VERSION,
+                "version": ATLAS_VERSION if domain == "atlas" else release_info.LATEST_VERSION,
             }
         else:
             stats[domain] = {
@@ -270,7 +389,7 @@ def format_objects(
     Args:
         objects: List of STIX objects or dicts containing {"object": obj}.
         include_description: Whether to include object descriptions.
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
 
     Returns:
         A formatted multi-line string.
@@ -334,10 +453,10 @@ mcp = MCPServer("mitre-attack-mcp-server", version=__version__)
 @mcp.tool()
 async def get_data_stats() -> Dict[str, Any]:
     """
-    Return statistics about downloaded MITRE ATT&CK STIX data.
+    Return statistics about downloaded MITRE ATT&CK and ATLAS STIX data.
 
     This confirms which domains are present on disk, their file paths,
-    sizes, and ATT&CK release version. It assumes that downloads have
+    sizes, and release version (ATT&CK release; pinned ATLAS release for "atlas"). It assumes that downloads have
     already been attempted at server startup.
     """
     return _compute_data_stats()
@@ -352,14 +471,14 @@ async def get_technique_by_id(
     """" 
     Retrieve a MITRE ATT&CK technique by its external ATT&CK ID (e.g., "T1055", "T1053.005").
 
-    This tool searches the specified ATT&CK domain (enterprise, mobile, or ics)
+    This tool searches the specified ATT&CK domain (enterprise, mobile, ics, or atlas)
     and returns both structured machine-readable data and an optional formatted
     human-readable text block. It is useful for user-facing responses as well
     as downstream programmatic reasoning.
 
     Args:
         technique_id: The external ATT&CK technique ID (e.g., "T1055").
-        domain: ATT&CK domain to search in ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain to search in ("enterprise", "mobile", "ics", "atlas").
         include_description: If True, returns the full ATT&CK description text.
 
     Returns:
@@ -423,7 +542,7 @@ async def get_object_by_attack_id(
     Args:
         attack_id: The external ATT&CK ID (e.g., "T1055", "G0016", "S0154", "M1013").
         stix_type: The STIX object type (e.g., "attack-pattern", "intrusion-set").
-        domain: ATT&CK domain ("enterprise", "mobile", or "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", or "atlas").
         include_description: Whether to include the object's description field.
 
     Returns:
@@ -503,7 +622,7 @@ async def get_object_by_stix_id(
 
     Args:
         stix_id: STIX object ID (e.g., "attack-pattern--...").
-        domain: ATT&CK domain to search in ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain to search in ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include the object's description.
 
     Returns:
@@ -599,7 +718,7 @@ async def get_objects_by_name(
         stix_type: STIX object type (same values as get_object_by_attack_id),
                    e.g. "attack-pattern", "intrusion-set", "malware",
                    "tool", "course-of-action", etc.
-        domain: ATT&CK domain ("enterprise", "mobile", or "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", or "atlas").
         include_description: Whether to include descriptions in the formatted output
                              and structured result.
         remove_revoked_deprecated: Exclude revoked/deprecated objects (default True).
@@ -723,7 +842,7 @@ async def get_objects_by_content(
             - "x-mitre-data-source"
             - "x-mitre-data-component"
             - etc.
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to return descriptions in the structured output.
         remove_revoked_deprecated: Exclude revoked/deprecated objects (default True).
 
@@ -832,8 +951,9 @@ async def get_techniques_by_tactic(
         - get_techniques_by_tactic("Persistence", "enterprise")
 
     Args:
-        tactic: Tactic name (e.g., "Initial Access", "Persistence").
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        tactic: Tactic display name (e.g., "Initial Access", "AI Attack Staging")
+                or shortname (e.g., "initial-access", "ai-attack-staging").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include technique descriptions
                              in the structured and formatted output.
 
@@ -856,9 +976,19 @@ async def get_techniques_by_tactic(
     """
     attack_data = get_attack_data(domain)
 
+    # Accept a display name ("Initial Access") or a shortname ("initial-access").
+    tactic_shortname = tactic
+    try:
+        for t in attack_data.get_tactics(remove_revoked_deprecated=True):
+            if (_field(t, "name", "") or "").lower() == tactic.strip().lower():
+                tactic_shortname = _field(t, "x_mitre_shortname") or tactic
+                break
+    except Exception:
+        pass
+
     try:
         techniques = attack_data.get_techniques_by_tactic(
-            tactic,
+            tactic_shortname,
             f"{domain}-attack",
             remove_revoked_deprecated=True,
         )
@@ -944,7 +1074,7 @@ async def search_techniques(
 
     Args:
         query: Text to search for in technique names and descriptions.
-        domain: ATT&CK domain ("enterprise", "mobile", or "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", or "atlas").
         include_description: Whether to include descriptions in the structured
                              result and formatted output.
 
@@ -1060,7 +1190,7 @@ async def get_group_by_name(
 
     Args:
         group_name: The group name or alias to search for (case-insensitive).
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include descriptions in the output.
 
     Returns:
@@ -1157,7 +1287,7 @@ async def get_stix_type(
 
     Args:
         stix_id: The STIX UUID identifier to look up.
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
 
     Returns:
         {
@@ -1204,7 +1334,7 @@ async def search_groups(
 
     Args:
         query: Search keyword (name, alias, or any text in the description).
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include descriptions in the output.
 
     Returns:
@@ -1328,7 +1458,7 @@ async def get_group_techniques(
 
     Args:
         group_name: Group name or alias (e.g., "APT29", "Lazarus Group").
-        domain: ATT&CK domain ("enterprise", "mobile", or "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", or "atlas").
         include_description: Whether to include descriptions in the output.
 
     Returns:
@@ -1536,7 +1666,7 @@ async def get_software(
     both malware and tools, as defined by the MITRE ATT&CK dataset.
 
     Args:
-        domain: ATT&CK domain to search ("enterprise", "mobile", or "ics").
+        domain: ATT&CK domain to search ("enterprise", "mobile", "ics", or "atlas").
         include_description: Whether to include descriptions in the output and
                              formatted text.
 
@@ -1632,7 +1762,7 @@ async def search_software(
 
     Args:
         query: Keyword to search for in software names and descriptions.
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include descriptions in the response.
 
     Returns:
@@ -1764,7 +1894,7 @@ async def get_attack_id(
 
     Args:
         stix_id: Full STIX UUID identifier.
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
 
     Returns:
         {
@@ -1822,7 +1952,7 @@ async def get_name(
 
     Args:
         stix_id: STIX UUID of the object.
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
 
     Returns:
         {
@@ -1873,7 +2003,7 @@ async def get_technique_tactics(
 
     Args:
         technique_id: External ATT&CK technique ID (e.g., "T1055", "T1055.002").
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
 
     Returns:
         {
@@ -1971,7 +2101,7 @@ async def get_stats(
     tactics, mitigations), excluding revoked/deprecated entries.
 
     Args:
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
 
     Returns:
         {
@@ -2036,7 +2166,7 @@ async def get_groups_by_alias(
 
     Args:
         alias: Alias to search for (e.g., "Cozy Bear", "NOBELIUM").
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include group descriptions.
         remove_revoked_deprecated: Exclude revoked/deprecated objects (default True).
 
@@ -2137,7 +2267,7 @@ async def get_techniques_used_by_group(
 
     Args:
         group_stix_id: STIX ID of the group (intrusion-set--UUID).
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include technique descriptions.
 
     Returns:
@@ -2320,7 +2450,7 @@ async def get_software_used_by_group(
 
     Args:
         group_stix_id: STIX ID of the group (e.g., "intrusion-set--UUID").
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include software descriptions.
 
     Returns:
@@ -2512,7 +2642,7 @@ async def get_campaigns_attributed_to_group(
 
     Args:
         group_stix_id: STIX UUID of the group (e.g., "intrusion-set--UUID").
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include campaign descriptions.
 
     Returns:
@@ -2649,7 +2779,7 @@ async def get_campaigns_by_alias(
 
     Args:
         alias: Campaign alias or alternate name (case-insensitive)
-        domain: ATT&CK domain ("enterprise", "ics", etc.)
+        domain: ATT&CK domain ("enterprise", "ics", "atlas", etc.)
         include_description: Include campaign descriptions in output
         remove_revoked_deprecated: Exclude revoked/deprecated objects (default True).
 
@@ -2744,7 +2874,7 @@ async def get_techniques_used_by_group_software(
 
     Args:
         group_stix_id: STIX ID of the group (e.g., "intrusion-set--UUID").
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include technique descriptions.
 
     Returns:
@@ -2931,7 +3061,7 @@ async def get_groups_using_technique(
     Args:
         technique_stix_id: STIX ID of the technique
                            (e.g., "attack-pattern--UUID").
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include group descriptions.
 
     Returns:
@@ -3126,7 +3256,7 @@ async def get_groups_using_software(
     Args:
         software_stix_id: STIX ID of the software object
                           (e.g., "malware--UUID", "tool--UUID").
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include group descriptions.
 
     Returns:
@@ -3319,7 +3449,7 @@ async def get_groups_attributing_to_campaign(
 
     Args:
         campaign_stix_id: STIX ID of the campaign (e.g., "campaign--UUID").
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include group descriptions.
 
     Returns:
@@ -3513,7 +3643,7 @@ async def get_software_by_alias(
 
     Args:
         alias: Alias to search for.
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include description fields.
         remove_revoked_deprecated: Exclude revoked/deprecated objects (default True).
 
@@ -3631,7 +3761,7 @@ async def get_software_using_technique(
     Args:
         technique_stix_id: STIX ID of the technique
                            (e.g., "attack-pattern--UUID").
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include software descriptions.
 
     Returns:
@@ -3824,7 +3954,7 @@ async def get_techniques_used_by_software(
     Args:
         software_stix_id: STIX ID of the software object
                           (e.g., "malware--UUID", "tool--UUID").
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include technique descriptions.
 
     Returns:
@@ -4015,7 +4145,7 @@ async def get_all_techniques(
     Get all ATT&CK techniques for a given domain.
 
     Args:
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated techniques.
         include_description: Whether to include technique descriptions.
 
@@ -4136,7 +4266,7 @@ async def get_all_subtechniques(
     e.g., T1566.001 and T1566.002 are subtechniques of T1566.
 
     Args:
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated subtechniques.
         include_description: Whether to include descriptions.
 
@@ -4298,7 +4428,7 @@ async def get_all_parent_techniques(
     e.g., T1566, T1055 (not T1566.001).
 
     Args:
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated techniques.
         include_description: Whether to include descriptions.
 
@@ -4431,7 +4561,7 @@ async def get_all_groups(
     Get all APT groups (intrusion sets) in a domain.
 
     Args:
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated groups.
         include_description: Whether to include descriptions.
 
@@ -4545,7 +4675,7 @@ async def get_all_software(
     returns structured results suitable for LLMs and clients.
 
     Args:
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated software.
         include_description: Whether to include descriptions.
 
@@ -4663,7 +4793,7 @@ async def get_all_mitigations(
     effectiveness of adversary techniques (e.g., M1013, M1017).
 
     Args:
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated mitigations.
         include_description: Whether to include descriptions.
 
@@ -4718,14 +4848,9 @@ async def get_all_mitigations(
     for m in mitigations:
         mitigations_for_format.append(m)
 
-        if isinstance(m, dict):
-            name = m.get("name")
-            stix_id = m.get("id")
-            description = m.get("description") if include_description else None
-        else:
-            name = getattr(m, "name", None)
-            stix_id = getattr(m, "id", None)
-            description = getattr(m, "description", None) if include_description else None
+        name = _field(m, "name")
+        stix_id = _field(m, "id")
+        description = _field(m, "description") if include_description else None
 
         # External ATT&CK ID (MXXXX)
         try:
@@ -4772,7 +4897,7 @@ async def get_all_tactics(
     Defense Evasion, Persistence).
 
     Args:
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics')
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas')
         include_description: Whether to include tactic descriptions.
 
     Returns:
@@ -4784,6 +4909,7 @@ async def get_all_tactics(
                "attack_id": "<TAxxxx>" | null,
                "name": "...",
                "stix_id": "x-mitre-tactic--UUID",
+               "shortname": "<kill chain phase name, e.g. initial-access>" | null,
                "description": "...",
              }
           ],
@@ -4820,9 +4946,10 @@ async def get_all_tactics(
     for t in tactics:
         tactics_for_format.append(t)
 
-        name = getattr(t, "name", None)
-        stix_id = getattr(t, "id", None)
-        description = getattr(t, "description", None) if include_description else None
+        # Tactics may be plain dicts (ATLAS fallback), so read through _field.
+        name = _field(t, "name")
+        stix_id = _field(t, "id")
+        description = _field(t, "description") if include_description else None
 
         # ATT&CK external ID (TAxxxx)
         try:
@@ -4835,6 +4962,7 @@ async def get_all_tactics(
                 "attack_id": attack_id,
                 "name": name,
                 "stix_id": stix_id,
+                "shortname": _field(t, "x_mitre_shortname"),
                 "description": description,
             }
         )
@@ -4869,7 +4997,7 @@ async def get_all_matrices(
     (e.g., Enterprise ATT&CK matrix).
 
     Args:
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated matrices.
         include_description: Whether to include descriptions.
 
@@ -4924,14 +5052,9 @@ async def get_all_matrices(
     for m in matrices:
         matrices_for_format.append(m)
 
-        if isinstance(m, dict):
-            name = m.get("name")
-            stix_id = m.get("id")
-            description = m.get("description") if include_description else None
-        else:
-            name = getattr(m, "name", None)
-            stix_id = getattr(m, "id", None)
-            description = getattr(m, "description", None) if include_description else None
+        name = _field(m, "name")
+        stix_id = _field(m, "id")
+        description = _field(m, "description") if include_description else None
 
         # External ID if available (sometimes matrix IDs exist, sometimes not)
         try:
@@ -4979,7 +5102,7 @@ async def get_all_campaigns(
     attributed to threat actors (e.g., SolarWinds, Operation Ghost).
 
     Args:
-        domain: ATT&CK domain ("enterprise", "mobile", "ics")
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas")
         remove_revoked_deprecated: Whether to exclude revoked/deprecated entries
         include_description: Include campaign descriptions in the output
 
@@ -5090,7 +5213,7 @@ async def get_all_datasources(
     (e.g., Process Monitoring, Network Traffic, File Monitoring).
 
     Args:
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated data sources.
         include_description: Whether to include descriptions.
 
@@ -5197,7 +5320,7 @@ async def get_all_datacomponents(
     "Process Creation", "Process Termination", etc.
 
     Args:
-        domain: ATT&CK domain ("enterprise", "mobile", "ics").
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated entries.
         include_description: Whether to include descriptions.
 
@@ -5657,7 +5780,7 @@ async def get_campaigns_using_technique(
     Args:
         technique_stix_id: Technique STIX UUID identifier
                            (e.g., 'attack-pattern--UUID').
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include campaign descriptions.
 
     Returns:
@@ -5844,7 +5967,7 @@ async def get_techniques_used_by_campaign(
     Args:
         campaign_stix_id: Campaign STIX UUID identifier
                           (e.g., 'campaign--UUID').
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include technique descriptions.
 
     Returns:
@@ -6045,7 +6168,7 @@ async def get_campaigns_using_software(
 
     Args:
         software_stix_id: Software STIX UUID identifier (e.g., 'malware--UUID', 'tool--UUID').
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include campaign descriptions.
 
     Returns:
@@ -6234,7 +6357,7 @@ async def get_software_used_by_campaign(
 
     Args:
         campaign_stix_id: Campaign STIX UUID identifier (e.g., 'campaign--UUID').
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include software descriptions.
 
     Returns:
@@ -6434,7 +6557,7 @@ async def get_techniques_by_platform(
         platform: Platform name as used in x_mitre_platforms (case-sensitive), e.g.
                   'Windows', 'Linux', 'macOS', 'IaaS', 'SaaS', 'Identity Provider',
                   'Office Suite', 'Containers', 'ESXi', 'Network Devices'.
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include technique descriptions.
         remove_revoked_deprecated: Exclude revoked/deprecated techniques (default True).
 
@@ -6532,7 +6655,7 @@ async def get_parent_technique_of_subtechnique(
 
     Args:
         technique_stix_id: STIX UUID of the subtechnique.
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include the parent's description.
 
     Returns:
@@ -6631,7 +6754,7 @@ async def get_subtechniques_of_technique(
 
     Args:
         technique_stix_id: STIX UUID of the parent technique.
-        domain: ATT&CK domain.
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include subtechnique descriptions.
 
     Returns:
@@ -6742,7 +6865,7 @@ async def get_techniques_mitigated_by_mitigation(
 
     Args:
         mitigation_stix_id: STIX UUID of the mitigation (e.g., course-of-action--UUID).
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Include technique descriptions in the output.
 
     Returns:
@@ -7277,7 +7400,7 @@ async def get_techniques_detected_by_datacomponent(
     Args:
         datacomponent_stix_id: Data component STIX UUID identifier
                                (e.g., 'x-mitre-data-component--UUID').
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include technique descriptions.
 
     Returns:
@@ -7446,7 +7569,7 @@ async def get_procedure_examples_by_technique(
 
     Args:
         technique_stix_id: STIX UUID of the technique
-        domain: ATT&CK domain
+        domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas")
         include_description: Include descriptions of the examples if available
 
     Returns:
@@ -7581,7 +7704,7 @@ async def get_procedure_examples_by_tactic(
     Args:
         tactic: Tactic name (e.g., "Initial Access", "Persistence").
                 Case-insensitive; should match ATT&CK tactic names.
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics').
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Include example descriptions when available.
 
     Returns:
@@ -7627,9 +7750,9 @@ async def get_procedure_examples_by_tactic(
         all_tactics = []
 
     for t in all_tactics:
-        t_name = getattr(t, "name", "") or ""
+        t_name = _field(t, "name", "") or ""
         if t_name.lower() == tactic_name_norm:
-            tactic_stix_id = getattr(t, "id", None)
+            tactic_stix_id = _field(t, "id")
             try:
                 tactic_attack_id = attack_data.get_attack_id(tactic_stix_id)
             except Exception:
@@ -7782,7 +7905,7 @@ async def get_objects_by_type(
 
     Args:
         stix_type: STIX object type to fetch.
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', ...).
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas', ...).
         remove_revoked_deprecated: Exclude revoked/deprecated objects.
         include_description: Include object descriptions in output.
 
@@ -7883,7 +8006,7 @@ async def get_tactics_by_matrix(
 
     Args:
         matrix_stix_id: STIX ID of the matrix (e.g., x-mitre-matrix--UUID)
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics')
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas')
         include_description: Whether to include tactic descriptions
 
     Returns:
@@ -7904,8 +8027,11 @@ async def get_tactics_by_matrix(
     """
     attack_data = get_attack_data(domain)
 
+    # The library returns {matrix name: [tactic, ...]}; pick the matrix by STIX ID.
     try:
-        tactics = attack_data.get_tactics_by_matrix(matrix_stix_id) or []
+        matrix = attack_data.get_object_by_stix_id(matrix_stix_id)
+        matrix_name = _field(matrix, "name")
+        tactics = attack_data.get_tactics_by_matrix().get(matrix_name) or []
     except Exception:
         tactics = []
 
@@ -7920,7 +8046,7 @@ async def get_tactics_by_matrix(
 
     results = []
     for tac in tactics:
-        stix_id = tac.id
+        stix_id = _field(tac, "id")
         try:
             attack_id = attack_data.get_attack_id(stix_id)
         except Exception:
@@ -7928,10 +8054,10 @@ async def get_tactics_by_matrix(
 
         results.append(
             {
-                "name": getattr(tac, "name", None),
+                "name": _field(tac, "name"),
                 "stix_id": stix_id,
                 "attack_id": attack_id,
-                "description": getattr(tac, "description", None) if include_description else None,
+                "description": _field(tac, "description") if include_description else None,
             }
         )
 
@@ -7962,7 +8088,7 @@ async def get_tactics_by_technique(
 
     Args:
         technique_stix_id: Technique STIX UUID identifier (attack-pattern--UUID)
-        domain: ATT&CK domain ('enterprise', 'mobile', 'ics')
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas')
         include_description: Whether to include tactic descriptions
 
     Returns:
@@ -8002,7 +8128,7 @@ async def get_tactics_by_technique(
 
     results = []
     for tac in tactics:
-        stix_id = tac.id
+        stix_id = _field(tac, "id")
 
         try:
             attack_id = attack_data.get_attack_id(stix_id)
@@ -8011,12 +8137,10 @@ async def get_tactics_by_technique(
 
         results.append(
             {
-                "name": getattr(tac, "name", None),
+                "name": _field(tac, "name"),
                 "stix_id": stix_id,
                 "attack_id": attack_id,
-                "description": getattr(tac, "description", None)
-                if include_description
-                else None,
+                "description": _field(tac, "description") if include_description else None,
             }
         )
 
@@ -8320,7 +8444,8 @@ async def generate_layer(
     Args:
         attack_id: ATT&CK ID (Gxxxx, Mxxxx, Sxxxx, or Dxxxx)
         score: Score to assign to all matched techniques in the layer
-        domain: ATT&CK domain (e.g., "enterprise", "mobile", "ics")
+        domain: ATT&CK domain (e.g., "enterprise", "mobile", "ics"). "atlas" is
+                rejected: ATLAS has no groups/software; use ATLAS Navigator.
 
     Returns:
         {
@@ -8335,6 +8460,20 @@ async def generate_layer(
     import re
 
     from mitreattack.navlayers import UsageLayerGenerator
+
+    # ATLAS has no groups/software and the layer generator only knows ATT&CK domains.
+    if domain == "atlas":
+        return {
+            "success": False,
+            "attack_id": attack_id,
+            "domain": domain,
+            "count": 0,
+            "layer": None,
+            "message": (
+                "ATLAS layers not supported: ATLAS has no groups/software; "
+                "use ATLAS Navigator."
+            ),
+        }
 
     # Validate ATT&CK ID format: must be Gxxx/Mxxx/Sxxx/Dxxx
     if not re.match(r"^[GMSD]\d+$", attack_id):
@@ -8435,6 +8574,7 @@ async def get_layer_metadata(domain: str = "enterprise") -> Dict[str, Any]:
 
     Args:
         domain: One of "enterprise", "mobile", "ics". Defaults to "enterprise".
+            "atlas" is rejected: layers are not supported for ATLAS.
 
     Returns:
         {
@@ -8491,6 +8631,15 @@ async def get_layer_metadata(domain: str = "enterprise") -> Dict[str, Any]:
 
     # Normalize domain
     domain = domain.lower()
+    if domain == "atlas":
+        return {
+            "success": False,
+            "domain": domain,
+            "metadata": None,
+            "message": (
+                "ATLAS layers not supported: use ATLAS Navigator instead."
+            ),
+        }
     if domain not in domain_configs:
         return {
             "success": False,
@@ -8534,11 +8683,11 @@ def main() -> None:
     # Check if we need to download
     existing = check_existing_data()
     if len(existing) < len(DOMAINS):
-        print(f"Downloading MITRE ATT&CK data (version {release_info.LATEST_VERSION})...", file=sys.stderr)
+        print(f"Downloading MITRE ATT&CK data (ATT&CK {release_info.LATEST_VERSION}, ATLAS {ATLAS_VERSION})...", file=sys.stderr)
         downloaded = download_all_domains(force=False)
         print(f"Downloaded {len(downloaded)}/{len(DOMAINS)} domains", file=sys.stderr)
     else:
-        print(f"Using existing data (version {release_info.LATEST_VERSION})", file=sys.stderr)
+        print(f"Using existing data (ATT&CK {release_info.LATEST_VERSION}, ATLAS {ATLAS_VERSION})", file=sys.stderr)
     
     # Load domains into memory
     print("Loading domains into memory...", file=sys.stderr)

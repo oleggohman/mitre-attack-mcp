@@ -1,10 +1,10 @@
 # MITRE ATT&CK MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server that exposes the MITRE ATT&CK knowledge base (Enterprise, Mobile and ICS domains) to LLM clients through 65 tools. It loads the official ATT&CK STIX data with [`mitreattack-python`](https://github.com/mitre-attack/mitreattack-python) and serves it over stdio.
+A [Model Context Protocol](https://modelcontextprotocol.io) server that exposes the MITRE ATT&CK knowledge base (Enterprise, Mobile and ICS domains, plus MITRE ATLAS for AI systems) to LLM clients through 65 tools. It loads the official ATT&CK STIX data with [`mitreattack-python`](https://github.com/mitre-attack/mitreattack-python) and serves it over stdio.
 
 This repository is a fork of [imouiche/complete-mitre-attack-mcp-server](https://github.com/imouiche/complete-mitre-attack-mcp-server) by Dr. Inoussa Mouiche, licensed under Apache-2.0. The original design and tool set are his work. See [Changes in this fork](#changes-in-this-fork).
 
-- Version: 0.2.0
+- Version: 0.3.0
 - Python: 3.12 or newer
 - Dependencies: `mcp>=2.3.0,<3` (MCPServer API), `mitreattack-python>=6.3.1,<7`
 
@@ -14,11 +14,13 @@ The server is not published to PyPI or npm from this fork. Run it straight from 
 
 ### First start downloads data
 
-On first start the server downloads the ATT&CK STIX files for all three domains (about 60 MB; the release downloaded at the time of writing is v20.0). That can take longer than an MCP client's connect timeout. Run it once in a terminal first, wait for `Server ready!` on stderr, then stop it with Ctrl+C:
+On first start the server downloads the ATT&CK STIX files for the three ATT&CK domains (about 60 MB; the release downloaded at the time of writing is v20.0). That can take longer than an MCP client's connect timeout. Run it once in a terminal first, wait for `Server ready!` on stderr, then stop it with Ctrl+C:
 
 ```bash
 uvx --python 3.12 --from git+https://github.com/oleggohman/mitre-attack-mcp mitre-mcp-server
 ```
+
+It also downloads the pinned MITRE ATLAS bundle (about 0.4 MB) from GitHub and verifies its SHA-256. If the ATLAS download fails, the ATT&CK domains still load and the server starts; the download is retried on every start while ATLAS is missing.
 
 Later starts reuse the cached data.
 
@@ -57,6 +59,8 @@ uv run mitre-mcp-server   # start the server on stdio
 uv run pytest             # run the tests
 ```
 
+ATLAS tests are skipped when the ATLAS bundle is not available locally. Set `MITRE_MCP_REQUIRE_ATLAS=1` to make them fail instead of skip (useful in CI).
+
 ### npm launcher (`run.js`)
 
 `package.json` and `run.js` are inherited from upstream. `run.js` starts the server by trying `uvx`, then `python3`, then `python` (the last two with `src/` on `PYTHONPATH` and the dependencies already installed). It moves to the next launcher only when a command is missing from `PATH`. If `uvx` is present but fails (for example offline on first install), or `python3` lacks the dependencies, it exits with that error and does not try the next one. The npm package `@imouiche/mitre-attack-mcp-server` belongs to upstream and is not published by this fork.
@@ -65,21 +69,24 @@ uv run pytest             # run the tests
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MITRE_MCP_DATA_DIR` | `~/.mitre-mcp-server/data` | Directory for downloaded ATT&CK data. Files go into `v<release>/` (for example `v20.0/`) with one `<domain>-attack.json` per domain. |
+| `MITRE_MCP_DATA_DIR` | `~/.mitre-mcp-server/data` | Directory for downloaded ATT&CK data. Files go into `v<release>/` (for example `v20.0/`) with one `<domain>-attack.json` per ATT&CK domain. ATLAS is stored in `atlas-v<version>/stix-atlas.json`. |
 
 The server logs to stderr only, because stdout carries the MCP stream.
 
 ## Behavior notes
 
 - **Revoked and deprecated objects are excluded by default.** These tools take `remove_revoked_deprecated` (default `True`); pass `False` to include them: `get_objects_by_name`, `get_objects_by_content`, `get_all_techniques`, `get_all_subtechniques`, `get_all_parent_techniques`, `get_all_groups`, `get_all_software`, `get_all_mitigations`, `get_all_matrices`, `get_all_campaigns`, `get_all_datasources`, `get_all_datacomponents`, `get_all_assets`, `get_techniques_by_platform`, `get_objects_by_type`, `get_objects_created_after`, `get_objects_modified_after`, `get_groups_by_alias`, `get_software_by_alias`, `get_campaigns_by_alias`. Use `get_revoked_techniques` to list revoked techniques.
-- **Domains** are `enterprise` (default for most tools), `mobile` and `ics`.
+- **Domains** are `enterprise` (default for most tools), `mobile`, `ics` and `atlas` (MITRE ATLAS, adversarial threats to AI systems).
+- **ATLAS** data is pinned to a release in `server.py` (`ATLAS_VERSION`, `ATLAS_SHA256`; currently 1.16.0). To bump it, set both constants to the new tag and the SHA-256 of `dist/stix-atlas.json` at that tag in `mitre-atlas/atlas-navigator-data`. IDs look like `AML.T0051` (techniques), `AML.M0004` (mitigations) and `AML.TA0001` (tactics). ATLAS has no groups, software, campaigns or data sources, so those tools return empty results for `atlas`.
+- **Tactic names**: `get_techniques_by_tactic` accepts a display name (`Initial Access`, `AI Attack Staging`) or a shortname (`initial-access`, `ai-attack-staging`) in every domain. `get_all_tactics` now also returns each tactic's `shortname`.
 - **Platform names are case-sensitive** and must match ATT&CK `x_mitre_platforms` values, for example `Windows`, `Linux`, `macOS`, `IaaS`, `SaaS`, `Identity Provider`, `Office Suite`, `Containers`, `ESXi`, `Network Devices`. Used by `get_techniques_by_platform`.
-- **`generate_layer` accepts only group, mitigation, software and data component IDs** (`G`, `M`, `S`, `D` prefixes). Technique IDs (`T...`) are rejected.
+- **`generate_layer` accepts only group, mitigation, software and data component IDs** (`G`, `M`, `S`, `D` prefixes). Technique IDs (`T...`) are rejected, and `domain="atlas"` returns an error (use ATLAS Navigator).
 
 ## Known limitations
 
+- ATLAS case studies are not included (they are not in the STIX bundle), and ATLAS Navigator layers are not generated.
 - ATT&CK v18 replaced data-component-to-technique detection mappings with detection strategies and analytics. On v18 and later (including v20.0, the current download), `get_datacomponents_detecting_technique` and `get_techniques_detected_by_datacomponent` return empty results. They work only with pre-v18 data.
-- The first start needs network access to download the ATT&CK STIX data (see [First start downloads data](#first-start-downloads-data)).
+- The first start needs network access to download the ATT&CK and ATLAS STIX data (see [First start downloads data](#first-start-downloads-data)).
 
 ## Tools
 

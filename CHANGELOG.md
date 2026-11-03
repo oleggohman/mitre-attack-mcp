@@ -9,6 +9,28 @@ branches from upstream
 [imouiche/complete-mitre-attack-mcp-server](https://github.com/imouiche/complete-mitre-attack-mcp-server)
 at commit `243169c`.
 
+## [0.3.0] - 2026-11-03
+
+### Added
+- **MITRE ATLAS as a fourth domain (`atlas`)**, pinned to v1.16.0 and verified by
+  SHA-256 on download. Existing tools accept `domain="atlas"`. Groups, software,
+  campaigns and data sources do not exist in ATLAS and return empty results.
+  `generate_layer` returns a clear error for `atlas`.
+- `get_all_tactics` entries include `shortname`.
+
+### Changed
+- `get_techniques_by_tactic` accepts a tactic display name or a shortname in all
+  domains.
+- Failed domain downloads are logged to stderr instead of being silently ignored.
+
+### Fixed
+- `get_tactics_by_matrix` always returned an empty result (it called the library
+  with an argument it does not take). It now resolves the matrix by STIX ID.
+- `get_techniques_by_tactic` returned nothing for display names such as
+  "Initial Access", although its docstring showed them as examples.
+- Tactic and matrix tools now read fields through mapping-safe access, so plain-dict
+  results no longer produce null names.
+
 ## [0.2.0] - 2026-11-02
 
 ### Changed
