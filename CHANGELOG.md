@@ -30,6 +30,14 @@ at commit `243169c`.
   "Initial Access", although its docstring showed them as examples.
 - Tactic and matrix tools now read fields through mapping-safe access, so plain-dict
   results no longer produce null names.
+- Relationship-based tools returned null fields or crashed because they treated the
+  library's `{"object", "relationships"}` wrapper entries as the objects themselves:
+  `get_subtechniques_of_technique`, `get_parent_technique_of_subtechnique`,
+  `get_all_subtechniques` (parent fields), `get_campaigns_attributed_to_group`,
+  `get_techniques_mitigated_by_mitigation`, `get_techniques_targeting_asset`,
+  `get_assets_targeted_by_technique` and `get_techniques_detected_by_datacomponent`.
+- `get_all_parent_techniques` returned no results for `atlas` (every ATLAS ID contains
+  a dot). It now filters on the sub-technique flag.
 
 ## [0.2.0] - 2026-11-02
 

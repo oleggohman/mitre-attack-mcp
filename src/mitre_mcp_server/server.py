@@ -378,6 +378,13 @@ def _field(obj: Any, key: str, default: Any = None) -> Any:
         return getattr(obj, key, default)
 
 
+def _unwrap(entry: Any) -> Any:
+    """Return the STIX object from a RelationshipEntry wrapper, or the entry itself."""
+    if isinstance(entry, dict) and "object" in entry:
+        return entry["object"]
+    return entry
+
+
 def format_objects(
     objects: List[Any],
     include_description: bool = False,
@@ -2701,7 +2708,10 @@ async def get_campaigns_attributed_to_group(
 
     # Retrieve campaigns for this group
     try:
-        campaign_entries = attack_data.get_campaigns_attributed_to_group(group_stix_id)
+        campaign_entries = [
+            _unwrap(e)
+            for e in (attack_data.get_campaigns_attributed_to_group(group_stix_id) or [])
+        ]
     except Exception:
         campaign_entries = []
 
@@ -2721,14 +2731,9 @@ async def get_campaigns_attributed_to_group(
     campaign_objects_for_format = []
 
     for c in campaign_entries:
-        if isinstance(c, dict):
-            name = c.get("name")
-            stix_id = c.get("id")
-            desc = c.get("description") if include_description else None
-        else:
-            name = getattr(c, "name", None)
-            stix_id = getattr(c, "id", None)
-            desc = getattr(c, "description", None) if include_description else None
+        name = _field(c, "name")
+        stix_id = _field(c, "id")
+        desc = _field(c, "description") if include_description else None
 
         # Save for formatted output
         campaign_objects_for_format.append(c)
@@ -4329,11 +4334,11 @@ async def get_all_subtechniques(
 
         # Check if this technique has a parent (i.e., is a subtechnique)
         try:
-            parent_obj = attack_data.get_parent_technique_of_subtechnique(stix_id)
+            parent_entries = attack_data.get_parent_technique_of_subtechnique(stix_id)
         except Exception:
-            parent_obj = None
+            parent_entries = []
 
-        if not parent_obj:
+        if not parent_entries:
             # Not a subtechnique
             continue
 
@@ -4347,12 +4352,9 @@ async def get_all_subtechniques(
             sub_attack_id = None
 
         # Resolve parent fields
-        if isinstance(parent_obj, dict):
-            parent_stix_id = parent_obj.get("id")
-            parent_name = parent_obj.get("name")
-        else:
-            parent_stix_id = getattr(parent_obj, "id", None)
-            parent_name = getattr(parent_obj, "name", None)
+        parent_obj = _unwrap(parent_entries[0])
+        parent_stix_id = _field(parent_obj, "id")
+        parent_name = _field(parent_obj, "name")
 
         try:
             parent_attack_id = (
@@ -4453,7 +4455,7 @@ async def get_all_parent_techniques(
     attack_data = get_attack_data(domain)
 
     try:
-        # This call *already* returns techniques without including subtechniques
+        # Subtechniques are filtered out below via x_mitre_is_subtechnique
         techniques = attack_data.get_techniques(
             remove_revoked_deprecated=remove_revoked_deprecated
         )
@@ -4495,8 +4497,8 @@ async def get_all_parent_techniques(
             # If we can't resolve an ATT&CK ID, skip parent-check
             continue
 
-        # Parent techniques: no dot in ATT&CK ID
-        if "." in attack_id:
+        # Parent techniques: not flagged as subtechnique (ATLAS IDs contain dots too)
+        if _field(t, "x_mitre_is_subtechnique") is True:
             continue
 
         parent_objects.append(t)
@@ -5623,9 +5625,10 @@ async def get_assets_targeted_by_technique(
 
     # --- Fetch assets targeted by this technique ---
     try:
-        assets = attack_data.get_assets_targeted_by_technique(
-            technique_stix_id
-        ) or []
+        assets = [
+            _unwrap(e)
+            for e in (attack_data.get_assets_targeted_by_technique(technique_stix_id) or [])
+        ]
     except Exception:
         assets = []
 
@@ -5644,16 +5647,10 @@ async def get_assets_targeted_by_technique(
     # --- Build the structured list of assets ---
     asset_entries = []
     for a in assets:
-        if isinstance(a, dict):
-            name = a.get("name")
-            stix_id = a.get("id")
-            desc = a.get("description") if include_description else None
-            asset_type = a.get("x_mitre_asset_type")
-        else:
-            name = getattr(a, "name", None)
-            stix_id = getattr(a, "id", None)
-            desc = getattr(a, "description", None) if include_description else None
-            asset_type = getattr(a, "x_mitre_asset_type", None)
+        name = _field(a, "name")
+        stix_id = _field(a, "id")
+        desc = _field(a, "description") if include_description else None
+        asset_type = _field(a, "x_mitre_asset_type")
 
         asset_entries.append(
             {
@@ -5719,7 +5716,10 @@ async def get_techniques_targeting_asset(
     attack_data = get_attack_data(domain)
 
     try:
-        techniques = attack_data.get_techniques_targeting_asset(asset_stix_id) or []
+        techniques = [
+            _unwrap(e)
+            for e in (attack_data.get_techniques_targeting_asset(asset_stix_id) or [])
+        ]
     except Exception as e:
         return {
             "found": False,
@@ -5741,13 +5741,17 @@ async def get_techniques_targeting_asset(
     # Build machine-readable list
     out = []
     for tech in techniques:
-        attack_id = attack_data.get_attack_id(tech.id)
+        tech_stix = _field(tech, "id")
+        try:
+            attack_id = attack_data.get_attack_id(tech_stix)
+        except Exception:
+            attack_id = None
         out.append(
             {
                 "id": attack_id,
-                "name": getattr(tech, "name", None),
-                "stix_id": tech.id,
-                "description": getattr(tech, "description", None) if include_description else None,
+                "name": _field(tech, "name"),
+                "stix_id": tech_stix,
+                "description": _field(tech, "description") if include_description else None,
             }
         )
 
@@ -6680,13 +6684,13 @@ async def get_parent_technique_of_subtechnique(
     except Exception:
         sub_attack_id = None
 
-    # Try retrieving the parent STIX ID
+    # The library returns a list of RelationshipEntry wrappers (empty if not a subtechnique)
     try:
-        parent_stix_id = attack_data.get_parent_technique_of_subtechnique(technique_stix_id)
+        parent_entries = attack_data.get_parent_technique_of_subtechnique(technique_stix_id)
     except Exception:
-        parent_stix_id = None
+        parent_entries = []
 
-    if not parent_stix_id:
+    if not parent_entries:
         return {
             "subtechnique_stix_id": technique_stix_id,
             "subtechnique_attack_id": sub_attack_id,
@@ -6698,22 +6702,12 @@ async def get_parent_technique_of_subtechnique(
             ),
         }
 
-    # Load the parent technique object
-    parent_obj = attack_data.get_object_by_stix_id(parent_stix_id)
-    if parent_obj is None:
-        return {
-            "subtechnique_stix_id": technique_stix_id,
-            "subtechnique_attack_id": sub_attack_id,
-            "parent": None,
-            "formatted": "",
-            "message": (
-                f"Parent STIX ID '{parent_stix_id}' not found in domain '{domain}'."
-            ),
-        }
+    parent_obj = _unwrap(parent_entries[0])
+    parent_stix_id = _field(parent_obj, "id")
 
     # Extract parent attributes
-    parent_name = getattr(parent_obj, "name", None)
-    parent_desc = getattr(parent_obj, "description", None) if include_description else None
+    parent_name = _field(parent_obj, "name")
+    parent_desc = _field(parent_obj, "description") if include_description else None
 
     try:
         parent_attack_id = attack_data.get_attack_id(parent_stix_id)
@@ -6791,7 +6785,10 @@ async def get_subtechniques_of_technique(
 
     # Retrieve subtechniques
     try:
-        subs = attack_data.get_subtechniques_of_technique(technique_stix_id) or []
+        subs = [
+            _unwrap(e)
+            for e in (attack_data.get_subtechniques_of_technique(technique_stix_id) or [])
+        ]
     except Exception:
         subs = []
 
@@ -6814,10 +6811,13 @@ async def get_subtechniques_of_technique(
     # Convert subtechniques to structured form
     sub_list = []
     for obj in subs:
-        stix_id = obj.id
-        name = getattr(obj, "name", None)
-        attack_id = attack_data.get_attack_id(stix_id)
-        desc = getattr(obj, "description", None) if include_description else None
+        stix_id = _field(obj, "id")
+        name = _field(obj, "name")
+        try:
+            attack_id = attack_data.get_attack_id(stix_id)
+        except Exception:
+            attack_id = None
+        desc = _field(obj, "description") if include_description else None
 
         sub_list.append(
             {
@@ -6915,9 +6915,12 @@ async def get_techniques_mitigated_by_mitigation(
 
     # --- Fetch techniques mitigated by this mitigation ---
     try:
-        techniques = attack_data.get_techniques_mitigated_by_mitigation(
-            mitigation_stix_id
-        ) or []
+        techniques = [
+            _unwrap(e)
+            for e in (
+                attack_data.get_techniques_mitigated_by_mitigation(mitigation_stix_id) or []
+            )
+        ]
     except Exception:
         techniques = []
 
@@ -6941,9 +6944,9 @@ async def get_techniques_mitigated_by_mitigation(
     # --- Build list of technique entries ---
     technique_entries = []
     for t in techniques:
-        stix_id = getattr(t, "id", None)
-        name = getattr(t, "name", None)
-        desc = getattr(t, "description", None) if include_description else None
+        stix_id = _field(t, "id")
+        name = _field(t, "name")
+        desc = _field(t, "description") if include_description else None
 
         try:
             attack_id = attack_data.get_attack_id(stix_id)
@@ -7488,9 +7491,13 @@ async def get_techniques_detected_by_datacomponent(
 
     # --- Fetch techniques detected by this data component ---
     try:
-        techniques = attack_data.get_techniques_detected_by_datacomponent(
-            datacomponent_stix_id
-        ) or []
+        techniques = [
+            _unwrap(e)
+            for e in (
+                attack_data.get_techniques_detected_by_datacomponent(datacomponent_stix_id)
+                or []
+            )
+        ]
     except Exception:
         techniques = []
 
@@ -7509,14 +7516,9 @@ async def get_techniques_detected_by_datacomponent(
     # --- Let's build structured list of techniques ---
     technique_entries: List[Dict[str, Any]] = []
     for t in techniques:
-        if isinstance(t, dict):
-            t_name = t.get("name")
-            t_stix = t.get("id")
-            t_desc = t.get("description") if include_description else None
-        else:
-            t_name = getattr(t, "name", None)
-            t_stix = getattr(t, "id", None)
-            t_desc = getattr(t, "description", None) if include_description else None
+        t_name = _field(t, "name")
+        t_stix = _field(t, "id")
+        t_desc = _field(t, "description") if include_description else None
 
         try:
             t_attack_id = attack_data.get_attack_id(t_stix)

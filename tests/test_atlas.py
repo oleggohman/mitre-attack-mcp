@@ -1,10 +1,8 @@
 """Library-level ATLAS tests (subclass behaviour)."""
 
-import pytest
-
+from conftest import needs_atlas
 from mitre_mcp_server import server
 
-needs_atlas = pytest.mark.usefixtures("atlas_loaded")
 
 
 def _t0051(atlas):

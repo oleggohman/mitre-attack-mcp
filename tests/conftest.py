@@ -8,6 +8,8 @@ import pytest
 
 from mitre_mcp_server import server
 
+needs_atlas = pytest.mark.usefixtures("atlas_loaded")
+
 
 def _atlas_bundle_path():
     primary = server.get_stix_path("atlas")

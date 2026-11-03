@@ -1,12 +1,18 @@
-# MITRE ATT&CK MCP Server
+# MITRE ATT&CK and ATLAS MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server that exposes the MITRE ATT&CK knowledge base (Enterprise, Mobile and ICS domains, plus MITRE ATLAS for AI systems) to LLM clients through 65 tools. It loads the official ATT&CK STIX data with [`mitreattack-python`](https://github.com/mitre-attack/mitreattack-python) and serves it over stdio.
+A [Model Context Protocol](https://modelcontextprotocol.io) server that exposes two MITRE knowledge bases to LLM clients through 65 tools:
+
+- **MITRE ATT&CK** (Enterprise, Mobile and ICS domains), loaded with [`mitreattack-python`](https://github.com/mitre-attack/mitreattack-python).
+- **MITRE ATLAS** (adversarial threats to AI systems), loaded from the official ATLAS STIX bundle as the fourth domain, `atlas`.
+
+The server serves both over stdio. Most tools take a `domain` argument: `enterprise`, `mobile`, `ics` or `atlas`.
 
 This repository is a fork of [imouiche/complete-mitre-attack-mcp-server](https://github.com/imouiche/complete-mitre-attack-mcp-server) by Dr. Inoussa Mouiche, licensed under Apache-2.0. The original design and tool set are his work. See [Changes in this fork](#changes-in-this-fork).
 
 - Version: 0.3.0
 - Python: 3.12 or newer
 - Dependencies: `mcp>=2.3.0,<3` (MCPServer API), `mitreattack-python>=6.3.1,<7`
+- Tools: 65 (one `@mcp.tool` decorator each in `server.py`)
 
 ## Install and run
 
@@ -14,13 +20,13 @@ The server is not published to PyPI or npm from this fork. Run it straight from 
 
 ### First start downloads data
 
-On first start the server downloads the ATT&CK STIX files for the three ATT&CK domains (about 60 MB; the release downloaded at the time of writing is v20.0). That can take longer than an MCP client's connect timeout. Run it once in a terminal first, wait for `Server ready!` on stderr, then stop it with Ctrl+C:
+On first start the server downloads the STIX data for all four domains (see [Data sources](#data-sources)): about 60 MB for ATT&CK and about 0.4 MB for ATLAS. That can take longer than an MCP client's connect timeout. Run it once in a terminal first, wait for `Server ready!` on stderr, then stop it with Ctrl+C:
 
 ```bash
 uvx --python 3.12 --from git+https://github.com/oleggohman/mitre-attack-mcp mitre-mcp-server
 ```
 
-It also downloads the pinned MITRE ATLAS bundle (about 0.4 MB) from GitHub and verifies its SHA-256. If the ATLAS download fails, the ATT&CK domains still load and the server starts; the download is retried on every start while ATLAS is missing.
+If the ATLAS download fails (network error or SHA-256 mismatch), the ATT&CK domains still load and the server starts without `atlas`. The download is retried on every start while ATLAS is missing.
 
 Later starts reuse the cached data.
 
@@ -65,32 +71,78 @@ ATLAS tests are skipped when the ATLAS bundle is not available locally. Set `MIT
 
 `package.json` and `run.js` are inherited from upstream. `run.js` starts the server by trying `uvx`, then `python3`, then `python` (the last two with `src/` on `PYTHONPATH` and the dependencies already installed). It moves to the next launcher only when a command is missing from `PATH`. If `uvx` is present but fails (for example offline on first install), or `python3` lacks the dependencies, it exits with that error and does not try the next one. The npm package `@imouiche/mitre-attack-mcp-server` belongs to upstream and is not published by this fork.
 
+## Data sources
+
+| Domain | Source | Version | Download size | Integrity |
+|---|---|---|---|---|
+| `enterprise`, `mobile`, `ics` | ATT&CK STIX 2.1 files fetched by `mitreattack-python` (`download_stix`) | `release_info.LATEST_VERSION` of the installed `mitreattack-python`, resolved at runtime (v20.0 at the time of writing) | about 60 MB for the three domains | Expected hash taken from `mitreattack.release_info` |
+| `atlas` | `https://raw.githubusercontent.com/mitre-atlas/atlas-navigator-data/v<ATLAS_VERSION>/dist/stix-atlas.json` | Pinned in `server.py`: `ATLAS_VERSION = "1.16.0"` | about 0.4 MB | SHA-256 checked against `ATLAS_SHA256`; a mismatch raises and leaves no file |
+
+ATLAS is not part of `mitreattack.release_info`, so its version does not follow the ATT&CK release and is never updated automatically.
+
+Cache layout under `MITRE_MCP_DATA_DIR` (default `~/.mitre-mcp-server/data`):
+
+```text
+<data dir>/
+  v20.0/                     # ATT&CK release (v<release_info.LATEST_VERSION>)
+    enterprise-attack.json
+    mobile-attack.json
+    ics-attack.json
+  atlas-v1.16.0/             # atlas-v<ATLAS_VERSION>
+    stix-atlas.json
+```
+
+Bumping ATLAS: in `src/mitre_mcp_server/server.py`, set `ATLAS_VERSION` to the new tag of `mitre-atlas/atlas-navigator-data` and `ATLAS_SHA256` to the SHA-256 of `dist/stix-atlas.json` at that tag. A new `atlas-v<version>/` directory is downloaded on the next start; the old one is left in place.
+
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `MITRE_MCP_DATA_DIR` | `~/.mitre-mcp-server/data` | Directory for downloaded ATT&CK data. Files go into `v<release>/` (for example `v20.0/`) with one `<domain>-attack.json` per ATT&CK domain. ATLAS is stored in `atlas-v<version>/stix-atlas.json`. |
+| `MITRE_MCP_DATA_DIR` | `~/.mitre-mcp-server/data` | Directory for downloaded data (layout in [Data sources](#data-sources)). |
+| `MITRE_MCP_REQUIRE_ATLAS` | unset | Tests only: set to `1` to make ATLAS tests fail instead of skip when the bundle is missing. |
 
 The server logs to stderr only, because stdout carries the MCP stream.
+
+## ATLAS support
+
+`atlas` uses the same tools as the ATT&CK domains. The ATLAS STIX bundle contains techniques, sub-techniques, tactics, one matrix, mitigations and `mitigates` / `subtechnique-of` relationships, so only tools that read those return data.
+
+| Result for `domain="atlas"` | Tools |
+|---|---|
+| Returns data | Techniques, sub-techniques and parent techniques (`get_all_techniques`, `get_all_parent_techniques`, `get_all_subtechniques`, `get_subtechniques_of_technique`, `get_parent_technique_of_subtechnique`, `get_technique_by_id`); tactics (`get_all_tactics`, `get_techniques_by_tactic`, `get_technique_tactics`, `get_tactics_by_technique`); matrix (`get_all_matrices`, `get_tactics_by_matrix`); mitigations (`get_all_mitigations`, `get_mitigations_mitigating_technique`, `get_techniques_mitigated_by_mitigation`); search and lookup (`search_techniques`, `get_object_by_attack_id`, `get_object_by_stix_id`, `get_objects_by_name`, `get_objects_by_content`) |
+| Empty result | Groups, software, campaigns, data sources and data components, ICS assets, procedure examples (`get_all_groups`, `get_all_software`, `get_all_campaigns`, `get_all_datasources`, `get_all_datacomponents`, `get_all_assets`, `get_procedure_examples_by_technique`, and the tools built on those objects) |
+| Rejected with an error | `generate_layer`, `get_layer_metadata` (use ATLAS Navigator) |
+
+ATLAS IDs: `AML.T0051` (technique), `AML.T####.###` for sub-techniques, `AML.M0004` (mitigation), `AML.TA0001` (tactic). Technique and mitigation tools that take a `*_stix_id` need the STIX ID, not the `AML.` ID; resolve it with `get_object_by_attack_id`.
+
+### Example: AI threat-model lookup
+
+Tool names and arguments only; responses depend on the loaded ATLAS release.
+
+1. List the ATLAS tactics: `get_all_tactics(domain="atlas")`. Each entry includes `name`, `shortname` and `attack_id`.
+2. List techniques for one tactic: `get_techniques_by_tactic(tactic="AI Attack Staging", domain="atlas")`. The shortname `"ai-attack-staging"` works too.
+3. Resolve a technique to its STIX ID: `get_object_by_attack_id(attack_id="AML.T0051", stix_type="attack-pattern", domain="atlas")`. The `stix_id` field of the returned object is the STIX ID.
+4. Get mitigations for it: `get_mitigations_mitigating_technique(technique_stix_id="<stix_id from step 3>", domain="atlas")`.
+5. Search by keyword: `search_techniques(query="prompt injection", domain="atlas")`.
 
 ## Behavior notes
 
 - **Revoked and deprecated objects are excluded by default.** These tools take `remove_revoked_deprecated` (default `True`); pass `False` to include them: `get_objects_by_name`, `get_objects_by_content`, `get_all_techniques`, `get_all_subtechniques`, `get_all_parent_techniques`, `get_all_groups`, `get_all_software`, `get_all_mitigations`, `get_all_matrices`, `get_all_campaigns`, `get_all_datasources`, `get_all_datacomponents`, `get_all_assets`, `get_techniques_by_platform`, `get_objects_by_type`, `get_objects_created_after`, `get_objects_modified_after`, `get_groups_by_alias`, `get_software_by_alias`, `get_campaigns_by_alias`. Use `get_revoked_techniques` to list revoked techniques.
-- **Domains** are `enterprise` (default for most tools), `mobile`, `ics` and `atlas` (MITRE ATLAS, adversarial threats to AI systems).
-- **ATLAS** data is pinned to a release in `server.py` (`ATLAS_VERSION`, `ATLAS_SHA256`; currently 1.16.0). To bump it, set both constants to the new tag and the SHA-256 of `dist/stix-atlas.json` at that tag in `mitre-atlas/atlas-navigator-data`. IDs look like `AML.T0051` (techniques), `AML.M0004` (mitigations) and `AML.TA0001` (tactics). ATLAS has no groups, software, campaigns or data sources, so those tools return empty results for `atlas`.
+- **Domains** are `enterprise` (default for most tools), `mobile`, `ics` and `atlas`. See [ATLAS support](#atlas-support) for what `atlas` returns.
 - **Tactic names**: `get_techniques_by_tactic` accepts a display name (`Initial Access`, `AI Attack Staging`) or a shortname (`initial-access`, `ai-attack-staging`) in every domain. `get_all_tactics` now also returns each tactic's `shortname`.
 - **Platform names are case-sensitive** and must match ATT&CK `x_mitre_platforms` values, for example `Windows`, `Linux`, `macOS`, `IaaS`, `SaaS`, `Identity Provider`, `Office Suite`, `Containers`, `ESXi`, `Network Devices`. Used by `get_techniques_by_platform`.
-- **`generate_layer` accepts only group, mitigation, software and data component IDs** (`G`, `M`, `S`, `D` prefixes). Technique IDs (`T...`) are rejected, and `domain="atlas"` returns an error (use ATLAS Navigator).
+- **`generate_layer` accepts only group, mitigation, software and data component IDs** (`G`, `M`, `S`, `D` prefixes). Technique IDs (`T...`) are rejected. `generate_layer` and `get_layer_metadata` return an error for `domain="atlas"`.
 
 ## Known limitations
 
 - ATLAS case studies are not included (they are not in the STIX bundle), and ATLAS Navigator layers are not generated.
 - ATT&CK v18 replaced data-component-to-technique detection mappings with detection strategies and analytics. On v18 and later (including v20.0, the current download), `get_datacomponents_detecting_technique` and `get_techniques_detected_by_datacomponent` return empty results. They work only with pre-v18 data.
+- The ATLAS release is pinned and not auto-updated (see [Data sources](#data-sources)).
 - The first start needs network access to download the ATT&CK and ATLAS STIX data (see [First start downloads data](#first-start-downloads-data)).
 
 ## Tools
 
-65 tools, grouped here by purpose. Each takes a `domain` argument where it applies; see the docstrings in [`src/mitre_mcp_server/server.py`](src/mitre_mcp_server/server.py) for full parameters and return shapes.
+65 tools, grouped here by purpose. Each takes a `domain` argument (`enterprise`, `mobile`, `ics`, `atlas`) where it applies; groups, software, campaigns, data sources and assets are empty for `atlas` (see [ATLAS support](#atlas-support)). See the docstrings in [`src/mitre_mcp_server/server.py`](src/mitre_mcp_server/server.py) for full parameters and return shapes.
 
 ### Data and statistics
 
@@ -205,7 +257,7 @@ The server logs to stderr only, because stdout carries the MCP stream.
 | `get_assets_targeted_by_technique` | ICS assets targeted by a technique |
 | `get_techniques_targeting_asset` | Techniques that target an ICS asset |
 
-### ATT&CK Navigator layers
+### ATT&CK Navigator layers (not for ATLAS)
 
 | Tool | Description |
 |---|---|
@@ -221,17 +273,20 @@ To view a layer, save the returned `layer` JSON to a file and open it in the [AT
 - "Which mitigations address T1055?"
 - "Generate a Navigator layer for group G0016."
 - "Which campaigns used Cobalt Strike?"
+- "List the ATLAS tactics."
+- "Which ATLAS techniques fall under AI Attack Staging?"
+- "What mitigations does ATLAS list for AML.T0051?"
 
 ## Repository layout
 
 - `src/mitre_mcp_server/server.py` - server, data download/loading, all tools
-- `tests/test_revoked_filters.py` - tests for the revoked/deprecated filtering
+- `tests/` - pytest suite: revoked/deprecated filtering, ATLAS download and tools, tactic tools, enterprise regression
 - `run.js`, `package.json`, `server.json` - upstream npm launcher and registry metadata
 - `CHANGELOG.md` - change history of this fork
 
 ## Changes in this fork
 
-This fork branches from upstream commit `243169c`. In short: migration to the MCP Python SDK 2.x and current dependencies, exclusion of revoked/deprecated objects by default, removal of dead code and stale bundled ATT&CK data, a fixed npm launcher, and lint cleanup. Details are in [CHANGELOG.md](CHANGELOG.md).
+This fork branches from upstream commit `243169c`. In short: migration to the MCP Python SDK 2.x and current dependencies, MITRE ATLAS as a fourth domain (`atlas`), exclusion of revoked/deprecated objects by default, fixed `get_tactics_by_matrix` and tactic-name handling in `get_techniques_by_tactic`, removal of dead code and stale bundled ATT&CK data, a fixed npm launcher, and lint cleanup. Details are in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
@@ -241,5 +296,6 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 - Original project: [imouiche/complete-mitre-attack-mcp-server](https://github.com/imouiche/complete-mitre-attack-mcp-server) by Dr. Inoussa Mouiche (WASP Lab, University of Windsor).
 - [MITRE ATT&CK](https://attack.mitre.org/) data via [mitreattack-python](https://github.com/mitre-attack/mitreattack-python).
+- [MITRE ATLAS](https://atlas.mitre.org/) data from [mitre-atlas/atlas-navigator-data](https://github.com/mitre-atlas/atlas-navigator-data).
 
 MITRE ATT&CK is a registered trademark of The MITRE Corporation.
