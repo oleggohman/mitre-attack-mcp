@@ -1,6 +1,6 @@
 # MITRE ATT&CK and ATLAS MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server that exposes two MITRE knowledge bases to LLM clients through 65 tools:
+A [Model Context Protocol](https://modelcontextprotocol.io) server that exposes two MITRE knowledge bases to LLM clients through 67 tools:
 
 - **MITRE ATT&CK** (Enterprise, Mobile and ICS domains), loaded with [`mitreattack-python`](https://github.com/mitre-attack/mitreattack-python).
 - **MITRE ATLAS** (adversarial threats to AI systems), loaded from the official ATLAS STIX bundle as the fourth domain, `atlas`.
@@ -9,10 +9,10 @@ The server serves both over stdio. Most tools take a `domain` argument: `enterpr
 
 This repository is a fork of [imouiche/complete-mitre-attack-mcp-server](https://github.com/imouiche/complete-mitre-attack-mcp-server) by Dr. Inoussa Mouiche, licensed under Apache-2.0. The original design and tool set are his work. See [Changes in this fork](#changes-in-this-fork).
 
-- Version: 0.3.0
+- Version: 0.4.0
 - Python: 3.12 or newer
 - Dependencies: `mcp>=2.3.0,<3` (MCPServer API), `mitreattack-python>=6.3.1,<7`
-- Tools: 65 (one `@mcp.tool` decorator each in `server.py`)
+- Tools: 67 (one `@mcp.tool` decorator each in `server.py`)
 
 ## Install and run
 
@@ -99,6 +99,7 @@ Bumping ATLAS: in `src/mitre_mcp_server/server.py`, set `ATLAS_VERSION` to the n
 | Variable | Default | Purpose |
 |---|---|---|
 | `MITRE_MCP_DATA_DIR` | `~/.mitre-mcp-server/data` | Directory for downloaded data (layout in [Data sources](#data-sources)). |
+| `MITRE_MCP_LAYER_DIR` | `~/.mitre-mcp-server/layers` | Directory for Navigator layers written with `save_to_file=True`. Files are created there only (mode 0600, never overwritten); clients cannot choose a path. |
 | `MITRE_MCP_REQUIRE_ATLAS` | unset | Tests only: set to `1` to make ATLAS tests fail instead of skip when the bundle is missing. |
 
 The server logs to stderr only, because stdout carries the MCP stream.
@@ -111,7 +112,8 @@ The server logs to stderr only, because stdout carries the MCP stream.
 |---|---|
 | Returns data | Techniques, sub-techniques and parent techniques (`get_all_techniques`, `get_all_parent_techniques`, `get_all_subtechniques`, `get_subtechniques_of_technique`, `get_parent_technique_of_subtechnique`, `get_technique_by_id`); tactics (`get_all_tactics`, `get_techniques_by_tactic`, `get_technique_tactics`, `get_tactics_by_technique`); matrix (`get_all_matrices`, `get_tactics_by_matrix`); mitigations (`get_all_mitigations`, `get_mitigations_mitigating_technique`, `get_techniques_mitigated_by_mitigation`); search and lookup (`search_techniques`, `get_object_by_attack_id`, `get_object_by_stix_id`, `get_objects_by_name`, `get_objects_by_content`) |
 | Empty result | Groups, software, campaigns, data sources and data components, ICS assets, procedure examples (`get_all_groups`, `get_all_software`, `get_all_campaigns`, `get_all_datasources`, `get_all_datacomponents`, `get_all_assets`, `get_procedure_examples_by_technique`, and the tools built on those objects) |
-| Rejected with an error | `generate_layer`, `get_layer_metadata` (use ATLAS Navigator) |
+| Layers | `generate_technique_layer(domain="atlas")` and `get_layer_metadata("atlas")` (see [Layers](#navigator-layers)). `generate_layer` is rejected for `atlas` with a pointer to `generate_technique_layer` |
+| No detection strategies | `get_detection_strategies_for_technique` returns `count: 0` |
 
 ATLAS IDs: `AML.T0051` (technique), `AML.T####.###` for sub-techniques, `AML.M0004` (mitigation), `AML.TA0001` (tactic). Technique and mitigation tools that take a `*_stix_id` need the STIX ID, not the `AML.` ID; resolve it with `get_object_by_attack_id`.
 
@@ -131,18 +133,31 @@ Tool names and arguments only; responses depend on the loaded ATLAS release.
 - **Domains** are `enterprise` (default for most tools), `mobile`, `ics` and `atlas`. See [ATLAS support](#atlas-support) for what `atlas` returns.
 - **Tactic names**: `get_techniques_by_tactic` accepts a display name (`Initial Access`, `AI Attack Staging`) or a shortname (`initial-access`, `ai-attack-staging`) in every domain. `get_all_tactics` now also returns each tactic's `shortname`.
 - **Platform names are case-sensitive** and must match ATT&CK `x_mitre_platforms` values, for example `Windows`, `Linux`, `macOS`, `IaaS`, `SaaS`, `Identity Provider`, `Office Suite`, `Containers`, `ESXi`, `Network Devices`. Used by `get_techniques_by_platform`.
-- **`generate_layer` accepts only group, mitigation, software and data component IDs** (`G`, `M`, `S`, `D` prefixes). Technique IDs (`T...`) are rejected. `generate_layer` and `get_layer_metadata` return an error for `domain="atlas"`.
+- **Descriptions are off by default for list tools.** Tools that return lists default to `include_description=False`; single-object lookups (`get_technique_by_id`, `get_object_by_attack_id`, `get_object_by_stix_id`, `get_group_by_name`, `get_parent_technique_of_subtechnique`) and the procedure-example tools keep `True`. With `False`, no object description appears anywhere in the result (structured data and `formatted`).
+- **Relationships are opt-in.** The 12 relationship tools (for example `get_group_techniques`, `get_techniques_used_by_software`, `get_groups_using_technique`) omit the raw `relationships` records, including procedure text, unless `include_relationships=True`.
+- **Pagination and ordering.** `limit` / `offset` exist on `get_objects_modified_after`, `get_objects_created_after` (both default `limit=100`), `get_all_subtechniques`, `get_all_software`, `get_all_techniques`, `get_software`, `get_techniques_by_platform`, `get_all_parent_techniques`, `get_all_groups`, `get_objects_by_type`, `get_group_techniques`, `get_techniques_used_by_group`, `get_techniques_used_by_software` and `get_techniques_used_by_group_software`. The response adds `total`, `returned`, `offset`, `limit` and `has_more`; `count` is the total number of matches and `formatted` covers only the returned page. These tools always return items sorted by ATT&CK ID, so pages are stable. Pass `limit=None` to get everything; `limit=0` (or any negative value) returns no items but still reports `total` and `has_more`, which makes it a cheap count probe. Every successful response, including an empty one, carries these fields; error responses for invalid input (for example an invalid domain or timestamp) may omit them.
+- **Group provenance.** `get_group_techniques` and `get_techniques_used_by_group` mark each technique with `direct` (the group uses it) and `via_campaigns` (campaigns attributed to the group that use it), plus `direct_count` and `campaign_only_count`. `include_campaigns=False` keeps only direct techniques.
+- **Detection (ATT&CK v18+).** `get_detection_strategies_for_technique` returns detection strategies (DET), their analytics (AN) and log sources (data component, name, channel); `platform` filters analytics (case-insensitive) and strategies without a matching analytic are dropped. `get_datacomponents_detecting_technique` and `get_techniques_detected_by_datacomponent` use the same chain when no legacy `detects` relationship exists and accept ATT&CK IDs (`T1552.005`, `DC0070`) as well as STIX IDs. Data sources (`DS####`) are deprecated in v18+, so `data_source_*` fields are null and `get_all_datasources` is empty by default.
+
+### Navigator layers
+
+- `generate_layer` takes group, mitigation, software or data component IDs (`G####`, `M####`, `S####`, `DC####`). Technique IDs are rejected with a pointer to `generate_technique_layer`. Parameters: `score`, `include_campaigns` (groups, default `True`), `include_comments` (default `False`; adds technique descriptions) and `save_to_file`.
+- `generate_technique_layer` builds a layer from a list of technique IDs or objects `{technique_id, score?, color?, comment?}` (1-2000 items, IDs are case-insensitive, unknown keys are rejected). It reports `unknown_ids`, revoked/deprecated `skipped` IDs and `auto_added_parents`. `count` covers the selected techniques only.
+- Entries carry no `tactic`, so each annotation applies under every tactic of the technique. A sub-technique whose parent is not listed gets a bare parent entry with `showSubtechniques`.
+- `save_to_file=True` writes the layer to `MITRE_MCP_LAYER_DIR` and returns `layer_path` instead of the layer. Filenames are built from the layer name plus a UTC timestamp and are ASCII-only (other characters in the name become `-`) for portability.
+- Layer tools build plain dictionaries and print nothing to stdout.
+- **ATLAS layers** use the domain `atlas-atlas` and layer format 4.3, mirroring MITRE's published ATLAS Navigator layers. The format was checked by automated structural tests only and **has not been load-tested in the live ATLAS Navigator**, which serves data from the deprecated `atlas-navigator-data` main branch; technique IDs newer than that data may be ignored.
 
 ## Known limitations
 
-- ATLAS case studies are not included (they are not in the STIX bundle), and ATLAS Navigator layers are not generated.
-- ATT&CK v18 replaced data-component-to-technique detection mappings with detection strategies and analytics. On v18 and later (including v20.0, the current download), `get_datacomponents_detecting_technique` and `get_techniques_detected_by_datacomponent` return empty results. They work only with pre-v18 data.
+- ATLAS case studies are not included (they are not in the STIX bundle). ATLAS layers are not load-tested in the live ATLAS Navigator (see [Navigator layers](#navigator-layers)).
+- `get_procedure_examples_by_tactic` always returns 0 results: it calls a method that does not exist on the library and swallows the error. Use `get_procedure_examples_by_technique` meanwhile.
 - The ATLAS release is pinned and not auto-updated (see [Data sources](#data-sources)).
 - The first start needs network access to download the ATT&CK and ATLAS STIX data (see [First start downloads data](#first-start-downloads-data)).
 
 ## Tools
 
-65 tools, grouped here by purpose. Each takes a `domain` argument (`enterprise`, `mobile`, `ics`, `atlas`) where it applies; groups, software, campaigns, data sources and assets are empty for `atlas` (see [ATLAS support](#atlas-support)). See the docstrings in [`src/mitre_mcp_server/server.py`](src/mitre_mcp_server/server.py) for full parameters and return shapes.
+67 tools, grouped here by purpose. Each takes a `domain` argument (`enterprise`, `mobile`, `ics`, `atlas`) where it applies; groups, software, campaigns, data sources and assets are empty for `atlas` (see [ATLAS support](#atlas-support)). See the docstrings in [`src/mitre_mcp_server/server.py`](src/mitre_mcp_server/server.py) for full parameters and return shapes.
 
 ### Data and statistics
 
@@ -246,8 +261,9 @@ Tool names and arguments only; responses depend on the loaded ATLAS release.
 |---|---|
 | `get_all_datasources` | All data sources in a domain |
 | `get_all_datacomponents` | All data components in a domain |
-| `get_datacomponents_detecting_technique` | Data components that detect a technique (see [Known limitations](#known-limitations)) |
-| `get_techniques_detected_by_datacomponent` | Techniques detected by a data component (see [Known limitations](#known-limitations)) |
+| `get_detection_strategies_for_technique` | Detection strategies, analytics and log sources for a technique (ATT&CK v18+) |
+| `get_datacomponents_detecting_technique` | Data components that detect a technique (detection-strategy chain on v18+) |
+| `get_techniques_detected_by_datacomponent` | Techniques detected by a data component (detection-strategy chain on v18+) |
 
 ### ICS assets
 
@@ -257,14 +273,15 @@ Tool names and arguments only; responses depend on the loaded ATLAS release.
 | `get_assets_targeted_by_technique` | ICS assets targeted by a technique |
 | `get_techniques_targeting_asset` | Techniques that target an ICS asset |
 
-### ATT&CK Navigator layers (not for ATLAS)
+### Navigator layers
 
 | Tool | Description |
 |---|---|
-| `generate_layer` | Navigator layer JSON for a group, mitigation, software or data component ID (`G`/`M`/`S`/`D` only), with a `score` and `domain` |
-| `get_layer_metadata` | Default Navigator layer metadata template for a domain |
+| `generate_layer` | Navigator layer for a group, mitigation, software or data component ID (`G`/`M`/`S`/`DC`), with `score` and `domain` |
+| `generate_technique_layer` | Navigator layer from an explicit list of technique IDs (ATT&CK domains and ATLAS) |
+| `get_layer_metadata` | Default Navigator layer metadata template for a domain (including `atlas`) |
 
-To view a layer, save the returned `layer` JSON to a file and open it in the [ATT&CK Navigator](https://mitre-attack.github.io/attack-navigator/).
+To view a layer, use `save_to_file=True` (or save the returned `layer` JSON) and open it in the [ATT&CK Navigator](https://mitre-attack.github.io/attack-navigator/) or, for ATLAS, the [ATLAS Navigator](https://mitre-atlas.github.io/atlas-navigator/).
 
 ## Example prompts
 

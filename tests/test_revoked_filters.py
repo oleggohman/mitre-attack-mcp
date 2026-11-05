@@ -82,7 +82,10 @@ async def test_objects_after_timestamp_excludes_revoked_by_default(tool):
 @pytest.mark.parametrize("tool", ["get_objects_created_after", "get_objects_modified_after"])
 async def test_objects_after_timestamp_can_include_revoked(tool):
     res = await getattr(server, tool)(
-        "2018-01-01T00:00:00Z", include_description=False, remove_revoked_deprecated=False
+        "2018-01-01T00:00:00Z",
+        include_description=False,
+        remove_revoked_deprecated=False,
+        limit=None,
     )
     assert [i for i in _object_ids(res) if _is_revoked_or_deprecated(i)] != []
 

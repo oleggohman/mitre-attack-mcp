@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-10-17/server.schema.json",
   "name": "io.github.imouiche/mitre-attack-mcp-server",
-  "description": "MCP server providing 65 tools for MITRE ATT&CK techniques, groups, software, campaigns and mitigations",
+  "description": "MCP server providing 67 tools for MITRE ATT&CK techniques, groups, software, campaigns and mitigations",
   "repository": {
     "url": "https://github.com/imouiche/complete-mitre-attack-mcp-server",
     "source": "github"
   },
-  "version": "0.3.0",
+  "version": "0.4.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@imouiche/mitre-attack-mcp-server",
-      "version": "0.3.0",
+      "version": "0.4.0",
       "transport": {
         "type": "stdio"
       },

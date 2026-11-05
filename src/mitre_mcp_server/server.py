@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import os
+import re
 import sys
 import tempfile
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from mcp.server.mcpserver import MCPServer
 from mitreattack import download_stix, release_info
@@ -40,6 +44,15 @@ DATA_DIR: Path = Path(
         Path.home() / f".{APP_NAME}" / "data",
     )
 ).expanduser()
+
+# Directory for Navigator layers written with save_to_file=True. Layer files are only ever
+# created inside this directory; clients cannot choose a path.
+LAYER_DIR: Path = Path(
+    os.getenv(
+        "MITRE_MCP_LAYER_DIR",
+        Path.home() / f".{APP_NAME}" / "layers",
+    )
+).expanduser().resolve()
 
 
 def get_version_dir() -> Path:
@@ -257,6 +270,121 @@ class _MitreData(MitreAttackData):
             techniques = self.remove_revoked_deprecated(techniques)
         return techniques
 
+    # -- Detection strategy chain (ATT&CK v18+): technique -> DET -> analytic -> data component --
+
+    def _detection_index(self) -> Dict[str, Any]:
+        """Build (once per instance) lookup tables for the detection chain.
+
+        Analytics may be library objects or plain dicts depending on the accessor, so every
+        read goes through _field / ["id"], never attribute access.
+        """
+        idx = getattr(self, "_mcp_detection_index", None)
+        if idx is not None:
+            return idx
+
+        analytics_by_id: Dict[str, Any] = {}
+        dets_by_analytic: Dict[str, List[str]] = {}
+        analytics_by_dc: Dict[str, List[str]] = {}
+        dets_by_id: Dict[str, Any] = {}
+
+        build_ok = True
+        try:
+            analytics = self.get_analytics(remove_revoked_deprecated=True) or []
+        except Exception as exc:
+            print(f"detection index: get_analytics failed: {exc!r}", file=sys.stderr)
+            analytics = []
+            build_ok = False
+        try:
+            dets = self.get_detectionstrategies(remove_revoked_deprecated=True) or []
+        except Exception as exc:
+            print(f"detection index: get_detectionstrategies failed: {exc!r}", file=sys.stderr)
+            dets = []
+            build_ok = False
+
+        for an in analytics:
+            an_id = _field(an, "id")
+            if not an_id:
+                continue
+            analytics_by_id[an_id] = an
+            for ref in _field(an, "x_mitre_log_source_references") or []:
+                dc_ref = _field(ref, "x_mitre_data_component_ref")
+                if not dc_ref:
+                    continue
+                bucket = analytics_by_dc.setdefault(dc_ref, [])
+                if an_id not in bucket:
+                    bucket.append(an_id)
+
+        for det in dets:
+            det_id = _field(det, "id")
+            if not det_id:
+                continue
+            dets_by_id[det_id] = det
+            for an_id in _field(det, "x_mitre_analytic_refs") or []:
+                bucket = dets_by_analytic.setdefault(an_id, [])
+                if det_id not in bucket:
+                    bucket.append(det_id)
+
+        idx = {
+            "analytics_by_id": analytics_by_id,
+            "dets_by_analytic": dets_by_analytic,
+            "analytics_by_dc": analytics_by_dc,
+            "dets_by_id": dets_by_id,
+        }
+        if build_ok:
+            # A failed build is returned but not cached, so the next call retries.
+            self._mcp_detection_index = idx
+        return idx
+
+    def detection_chain_for_technique(self, tech_stix_id: str) -> List[Dict[str, Any]]:
+        """Return [{"detection_strategy": det, "analytics": [analytic, ...]}] for a technique."""
+        idx = self._detection_index()
+        try:
+            entries = self.get_detection_strategies_detecting_technique(tech_stix_id) or []
+        except Exception:
+            return []
+        chain: List[Dict[str, Any]] = []
+        seen = set()
+        for entry in entries:
+            det = _unwrap(entry)
+            det_id = _field(det, "id")
+            if not det_id or det_id in seen:
+                continue
+            seen.add(det_id)
+            analytics = [
+                idx["analytics_by_id"][an_id]
+                for an_id in (_field(det, "x_mitre_analytic_refs") or [])
+                if an_id in idx["analytics_by_id"]
+            ]
+            chain.append({"detection_strategy": det, "analytics": analytics})
+        return chain
+
+    def techniques_for_datacomponent(self, dc_stix_id: str) -> List[Tuple[Any, List[str], List[str]]]:
+        """Return [(technique, [DET stix ids], [analytic stix ids])] detected via a data component.
+
+        Revoked/deprecated techniques are dropped; results are deduplicated by technique id.
+        """
+        idx = self._detection_index()
+        found: Dict[str, Tuple[Any, List[str], List[str]]] = {}
+        for an_id in idx["analytics_by_dc"].get(dc_stix_id, []):
+            for det_id in idx["dets_by_analytic"].get(an_id, []):
+                try:
+                    entries = self.get_techniques_detected_by_detection_strategy(det_id) or []
+                except Exception:
+                    continue
+                for entry in entries:
+                    tech = _unwrap(entry)
+                    t_id = _field(tech, "id")
+                    if not t_id:
+                        continue
+                    if _field(tech, "x_mitre_deprecated", False) or _field(tech, "revoked", False):
+                        continue
+                    _, det_ids, an_ids = found.setdefault(t_id, (tech, [], []))
+                    if det_id not in det_ids:
+                        det_ids.append(det_id)
+                    if an_id not in an_ids:
+                        an_ids.append(an_id)
+        return list(found.values())
+
 
 def load_domain(domain: str) -> bool:
     """
@@ -383,6 +511,130 @@ def _unwrap(entry: Any) -> Any:
     if isinstance(entry, dict) and "object" in entry:
         return entry["object"]
     return entry
+
+
+def _safe_attack_id(attack_data: Any, stix_id: Optional[str]) -> Optional[str]:
+    """Return the ATT&CK/ATLAS ID for a STIX ID, or None when it cannot be resolved."""
+    if not stix_id:
+        return None
+    try:
+        return attack_data.get_attack_id(stix_id)
+    except Exception:
+        return None
+
+
+def _resolve_stix_id(attack_data: Any, identifier: str, stix_type: str) -> str:
+    """Accept a STIX ID or an ATT&CK ID (no "--") and return a STIX ID when resolvable.
+
+    Unresolvable IDs are returned unchanged so callers keep their normal "not found" path.
+    """
+    ident = (identifier or "").strip()
+    if not ident or "--" in ident:
+        return ident
+    try:
+        obj = attack_data.get_object_by_attack_id(ident.upper(), stix_type)
+    except Exception:
+        obj = None
+    stix_id = _field(obj, "id") if obj is not None else None
+    return stix_id or ident
+
+
+def _group_technique_provenance(
+    attack_data: Any, group_stix_id: str, entry: Any
+) -> Dict[str, Any]:
+    """Derive how a group-technique entry came about.
+
+    Returns {"direct": bool, "via_campaigns": [C####, ...]}. `direct` is True when a `uses`
+    relationship has the group itself as source; campaigns are the `uses` relationships whose
+    source is a campaign (inherited through campaign attribution). Campaign IDs are sorted.
+    """
+    rels = _field(entry, "relationships", []) or []
+    direct = False
+    campaign_refs: List[str] = []
+    for r in rels:
+        if _field(r, "relationship_type") != "uses":
+            continue
+        src = _field(r, "source_ref") or ""
+        if src == group_stix_id:
+            direct = True
+        elif src.startswith("campaign--") and src not in campaign_refs:
+            campaign_refs.append(src)
+    via = sorted(
+        {aid if aid else ref for ref in campaign_refs for aid in [_safe_attack_id(attack_data, ref)]}
+    )
+    return {"direct": direct, "via_campaigns": via}
+
+
+def _provenance_message(direct_count: int, campaign_only: List[Dict[str, Any]]) -> str:
+    """Human-readable split such as '64 direct, 14 only via campaigns (C0027)'."""
+    campaigns = sorted({c for t in campaign_only for c in t["via_campaigns"]})
+    suffix = f" ({', '.join(campaigns)})" if campaigns else ""
+    return f"{direct_count} direct, {len(campaign_only)} only via campaigns{suffix}"
+
+
+def _relationships_info(rels: Any, include_description: bool = True) -> List[Dict[str, Any]]:
+    """Compact relationship dicts (stix_id, type, description, source/target refs).
+
+    The relationship description is emitted as None unless include_description is True.
+    """
+    return [
+        {
+            "stix_id": _field(r, "id"),
+            "relationship_type": _field(r, "relationship_type"),
+            "description": _field(r, "description") if include_description else None,
+            "source_ref": _field(r, "source_ref"),
+            "target_ref": _field(r, "target_ref"),
+        }
+        for r in (rels or [])
+    ]
+
+
+def _item_sort_key(item: Dict[str, Any]) -> Tuple[bool, str, str, str]:
+    """None-safe sort key: ATT&CK ID first (items without one last), then name, then STIX ID."""
+    aid = item.get("attack_id") if "attack_id" in item else item.get("id")
+    return (aid is None, aid or "", item.get("name") or "", item.get("stix_id") or "")
+
+
+def _paginate(
+    items: List[Any], limit: Optional[int] = None, offset: int = 0
+) -> Tuple[List[Any], Dict[str, Any]]:
+    """Slice `items`; limit None means no limit, limit <= 0 returns no items (count probe).
+
+    offset < 0 is treated as 0.
+
+    Returns (page, meta) where meta = {total, returned, offset, limit, has_more}.
+    """
+    total = len(items)
+    start = max(int(offset or 0), 0)
+    if limit is None:
+        page = items[start:]
+        eff_limit = None
+    else:
+        eff_limit = max(int(limit), 0)
+        page = items[start : start + eff_limit]
+    meta = {
+        "total": total,
+        "returned": len(page),
+        "offset": start,
+        "limit": eff_limit,
+        "has_more": start + len(page) < total,
+    }
+    return page, meta
+
+
+def _sort_and_page(
+    items: List[Dict[str, Any]], objects: List[Any], limit: Optional[int], offset: int
+) -> Tuple[List[Dict[str, Any]], List[Any], Dict[str, Any]]:
+    """Sort result items (None-safe), paginate, and return the matching STIX objects.
+
+    `objects` may be in any order; they are matched to the page by STIX ID so the
+    `formatted` block covers exactly the returned page.
+    """
+    by_id = {_field(o, "id"): o for o in objects}
+    ordered = sorted(items, key=_item_sort_key)
+    page, meta = _paginate(ordered, limit, offset)
+    page_objects = [by_id[i["stix_id"]] for i in page if i.get("stix_id") in by_id]
+    return page, page_objects, meta
 
 
 def format_objects(
@@ -525,10 +777,10 @@ async def get_technique_by_id(
     return {
         "found": True,
         "technique": {
-            "id": technique_id,
-            "name": getattr(tech, "name", None),
-            "stix_id": getattr(tech, "id", None),
-            "description": getattr(tech, "description", None)
+            "id": _safe_attack_id(attack_data, _field(tech, "id")) or technique_id,
+            "name": _field(tech, "name"),
+            "stix_id": _field(tech, "id"),
+            "description": _field(tech, "description") if include_description else None,
         },
         "formatted": formatted
     }
@@ -825,7 +1077,7 @@ async def get_objects_by_content(
     content: str,
     object_type: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
     remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -944,7 +1196,7 @@ async def get_objects_by_content(
 async def get_techniques_by_tactic(
     tactic: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all techniques associated with a specific ATT&CK tactic.
@@ -1063,7 +1315,7 @@ async def get_techniques_by_tactic(
 async def search_techniques(
     query: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Search MITRE ATT&CK techniques by keyword in their name or description.
@@ -1331,7 +1583,7 @@ async def get_stix_type(
 async def search_groups(
     query: str = "",
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Search MITRE ATT&CK intrusion sets (APT groups) by name, alias, or
@@ -1453,7 +1705,11 @@ async def search_groups(
 async def get_group_techniques(
     group_name: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
+    include_campaigns: bool = True,
+    include_relationships: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all techniques used by a specific APT group (intrusion set).
@@ -1467,6 +1723,12 @@ async def get_group_techniques(
         group_name: Group name or alias (e.g., "APT29", "Lazarus Group").
         domain: ATT&CK domain ("enterprise", "mobile", "ics", or "atlas").
         include_description: Whether to include descriptions in the output.
+        include_relationships: If True, include the raw relationship records
+            (with relationship descriptions) per item; omitted by default.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID.
+        offset: Number of items to skip (for paging with `limit`).
+        include_campaigns: If True (default), also include techniques the group inherits
+            through campaigns attributed to it; if False, only techniques the group uses directly.
 
     Returns:
         {
@@ -1479,12 +1741,16 @@ async def get_group_techniques(
               "description": "..." | null
           } | null,
           "count": <number of techniques>,
+          "direct_count": <techniques used directly>,
+          "campaign_only_count": <techniques reachable only via campaigns>,
           "techniques": [
             {
               "attack_id": "TXXXX or TXXXX.YYY",
               "name": "...",
               "stix_id": "attack-pattern--...",
               "description": "..." | null,
+              "direct": bool,  # group uses the technique itself
+              "via_campaigns": ["Cxxxx", ...],  # campaigns attributed to the group that use it
               "relationships": [
                 {
                   "stix_id": "relationship--...",
@@ -1527,9 +1793,12 @@ async def get_group_techniques(
 
     if group is None:
         return {
+            **_paginate([], limit, offset)[1],
             "found": False,
             "group": None,
             "count": 0,
+            "direct_count": 0,
+            "campaign_only_count": 0,
             "techniques": [],
             "formatted": "",
             "message": (
@@ -1580,6 +1849,10 @@ async def get_group_techniques(
         if tech_obj is None:
             continue
 
+        prov = _group_technique_provenance(attack_data, group_stix_id, entry)
+        if not include_campaigns and not prov["direct"]:
+            continue
+
         technique_objects_for_format.append(tech_obj)
 
         # Extract technique fields
@@ -1598,31 +1871,7 @@ async def get_group_techniques(
         except Exception:
             t_attack_id = None
 
-        # Compact relationship info
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
 
         techniques_structured.append(
             {
@@ -1630,11 +1879,24 @@ async def get_group_techniques(
                 "name": t_name,
                 "stix_id": t_stix_id,
                 "description": t_desc,
-                "relationships": relationships_info,
+                **({"relationships": relationships_info} if include_relationships else {}),
+                "direct": prov["direct"],
+                "via_campaigns": prov["via_campaigns"],
             }
         )
 
+    direct_count = sum(1 for t in techniques_structured if t["direct"])
+    campaign_only = [t for t in techniques_structured if not t["direct"]]
+
     # Human-readable formatted list of techniques (ignore relationship metadata there)
+    # Sort the full list before slicing so pages are stable; `count` stays the total.
+    obj_by_id = {_field(o, "id"): o for o in technique_objects_for_format}
+    techniques_structured.sort(key=_item_sort_key)
+    page, page_meta = _paginate(techniques_structured, limit, offset)
+    technique_objects_for_format = [
+        obj_by_id[t["stix_id"]] for t in page if t["stix_id"] in obj_by_id
+    ]
+
     formatted = ""
     if technique_objects_for_format:
         formatted = format_objects(
@@ -1653,11 +1915,15 @@ async def get_group_techniques(
             "description": group_desc,
         },
         "count": len(techniques_structured),
-        "techniques": techniques_structured,
+        "direct_count": direct_count,
+        "campaign_only_count": len(campaign_only),
+        "techniques": page,
+        **page_meta,
         "formatted": formatted,
         "message": (
             f"Found {len(techniques_structured)} technique(s) used by group "
-            f"'{group_name}' in domain '{domain}'."
+            f"'{group_name}' in domain '{domain}': "
+            f"{_provenance_message(direct_count, campaign_only)}."
         ),
     }
 
@@ -1665,6 +1931,8 @@ async def get_group_techniques(
 async def get_software(
     domain: str = "enterprise",
     include_description: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all software (malware and tools) in a given ATT&CK domain.
@@ -1676,6 +1944,8 @@ async def get_software(
         domain: ATT&CK domain to search ("enterprise", "mobile", "ics", or "atlas").
         include_description: Whether to include descriptions in the output and
                              formatted text.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        offset: Number of items to skip (for paging with `limit`).
 
     Returns:
         {
@@ -1703,6 +1973,7 @@ async def get_software(
 
     if not software_objs:
         return {
+            **_paginate([], limit, offset)[1],
             "count": 0,
             "software": [],
             "formatted": "",
@@ -1741,6 +2012,11 @@ async def get_software(
             }
         )
 
+    total_found = len(software_list)
+    software_list, software_objs, page_meta = _sort_and_page(
+        software_list, software_objs, limit, offset
+    )
+
     formatted = format_objects(
         software_objs,
         include_description=include_description,
@@ -1748,11 +2024,12 @@ async def get_software(
     )
 
     return {
-        "count": len(software_list),
+        "count": total_found,
+        **page_meta,
         "software": software_list,
         "formatted": formatted,
         "message": (
-            f"Found {len(software_list)} software object(s) "
+            f"Found {total_found} software object(s) "
             f"in domain '{domain}'."
         ),
     }
@@ -1761,7 +2038,7 @@ async def get_software(
 async def search_software(
     query: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Search MITRE ATT&CK software (malware & tools) by keyword in name or
@@ -2159,7 +2436,7 @@ async def get_stats(
 async def get_groups_by_alias(
     alias: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
     remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -2263,7 +2540,11 @@ async def get_groups_by_alias(
 async def get_techniques_used_by_group(
     group_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
+    include_campaigns: bool = True,
+    include_relationships: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all techniques used by a specific APT group, identified by its STIX ID.
@@ -2276,6 +2557,12 @@ async def get_techniques_used_by_group(
         group_stix_id: STIX ID of the group (intrusion-set--UUID).
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include technique descriptions.
+        include_relationships: If True, include the raw relationship records
+            (with relationship descriptions) per item; omitted by default.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID.
+        offset: Number of items to skip (for paging with `limit`).
+        include_campaigns: If True (default), also include techniques the group inherits
+            through campaigns attributed to it; if False, only techniques the group uses directly.
 
     Returns:
         {
@@ -2286,12 +2573,16 @@ async def get_techniques_used_by_group(
               "description": "<text or null>"
           } | null,
           "count": <number of techniques>,
+          "direct_count": <techniques used directly>,
+          "campaign_only_count": <techniques reachable only via campaigns>,
           "techniques": [
             {
               "attack_id": "TXXXX or TXXXX.YYY" | null,
               "name": "<technique name>",
               "stix_id": "<attack-pattern--UUID>",
               "description": "<text or null>",
+              "direct": bool,  # group uses the technique itself
+              "via_campaigns": ["Cxxxx", ...],  # campaigns attributed to the group that use it
               "relationships": [
                 {
                   "stix_id": "<relationship--UUID>",
@@ -2310,6 +2601,8 @@ async def get_techniques_used_by_group(
         }
     """
     attack_data = get_attack_data(domain)
+    # Accept an ATT&CK ID (G####) as well as a STIX ID.
+    group_stix_id = _resolve_stix_id(attack_data, group_stix_id, "intrusion-set")
 
     # Try to resolve basic group info from its STIX ID (optional but useful)
     try:
@@ -2346,8 +2639,11 @@ async def get_techniques_used_by_group(
 
     if not rel_entries:
         return {
+            **_paginate([], limit, offset)[1],
             "group": group_info,
             "count": 0,
+            "direct_count": 0,
+            "campaign_only_count": 0,
             "techniques": [],
             "formatted": "",
             "message": (
@@ -2370,6 +2666,10 @@ async def get_techniques_used_by_group(
         if tech_obj is None:
             continue
 
+        prov = _group_technique_provenance(attack_data, group_stix_id, entry)
+        if not include_campaigns and not prov["direct"]:
+            continue
+
         technique_objects_for_format.append(tech_obj)
 
         # Technique fields
@@ -2387,31 +2687,7 @@ async def get_techniques_used_by_group(
         except Exception:
             t_attack_id = None
 
-        # Relationship info
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
 
         techniques_structured.append(
             {
@@ -2419,9 +2695,22 @@ async def get_techniques_used_by_group(
                 "name": t_name,
                 "stix_id": t_stix_id,
                 "description": t_desc,
-                "relationships": relationships_info,
+                **({"relationships": relationships_info} if include_relationships else {}),
+                "direct": prov["direct"],
+                "via_campaigns": prov["via_campaigns"],
             }
         )
+
+    direct_count = sum(1 for t in techniques_structured if t["direct"])
+    campaign_only = [t for t in techniques_structured if not t["direct"]]
+
+    # Sort the full list before slicing so pages are stable; `count` stays the total.
+    obj_by_id = {_field(o, "id"): o for o in technique_objects_for_format}
+    techniques_structured.sort(key=_item_sort_key)
+    page, page_meta = _paginate(techniques_structured, limit, offset)
+    technique_objects_for_format = [
+        obj_by_id[t["stix_id"]] for t in page if t["stix_id"] in obj_by_id
+    ]
 
     formatted = ""
     if technique_objects_for_format:
@@ -2434,11 +2723,15 @@ async def get_techniques_used_by_group(
     return {
         "group": group_info,
         "count": len(techniques_structured),
-        "techniques": techniques_structured,
+        "direct_count": direct_count,
+        "campaign_only_count": len(campaign_only),
+        "techniques": page,
+        **page_meta,
         "formatted": formatted,
         "message": (
             f"Found {len(techniques_structured)} technique(s) for group STIX ID "
-            f"'{group_stix_id}' in domain '{domain}'."
+            f"'{group_stix_id}' in domain '{domain}': "
+            f"{_provenance_message(direct_count, campaign_only)}."
         ),
     }
 
@@ -2446,7 +2739,8 @@ async def get_techniques_used_by_group(
 async def get_software_used_by_group(
     group_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
+    include_relationships: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all software (malware and tools) used by a specific APT group,
@@ -2459,6 +2753,8 @@ async def get_software_used_by_group(
         group_stix_id: STIX ID of the group (e.g., "intrusion-set--UUID").
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include software descriptions.
+        include_relationships: If True, include the raw relationship records
+            (with relationship descriptions) per item; omitted by default.
 
     Returns:
         {
@@ -2574,30 +2870,7 @@ async def get_software_used_by_group(
         except Exception:
             s_attack_id = None
 
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
 
         software_structured.append(
             {
@@ -2606,7 +2879,7 @@ async def get_software_used_by_group(
                 "stix_id": s_stix_id,
                 "type": s_type,
                 "description": s_desc,
-                "relationships": relationships_info,
+                **({"relationships": relationships_info} if include_relationships else {}),
             }
         )
 
@@ -2638,7 +2911,7 @@ async def get_software_used_by_group(
 async def get_campaigns_attributed_to_group(
     group_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all campaigns attributed to a specific intrusion set (APT group),
@@ -2773,7 +3046,7 @@ async def get_campaigns_attributed_to_group(
 async def get_campaigns_by_alias(
     alias: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
     remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -2869,7 +3142,9 @@ async def get_campaigns_by_alias(
 async def get_techniques_used_by_group_software(
     group_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get techniques used by the software that a group uses (Group → Software → Techniques).
@@ -2881,6 +3156,8 @@ async def get_techniques_used_by_group_software(
         group_stix_id: STIX ID of the group (e.g., "intrusion-set--UUID").
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include technique descriptions.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID.
+        offset: Number of items to skip (for paging with `limit`).
 
     Returns:
         {
@@ -2899,16 +3176,6 @@ async def get_techniques_used_by_group_software(
               "name": "<technique name>",
               "stix_id": "<attack-pattern--UUID>",
               "description": "<text or null>",
-              "relationships": [
-                {
-                  "stix_id": "<relationship--UUID>",
-                  "relationship_type": "uses",
-                  "description": "<relationship description or null>",
-                  "source_ref": "<source STIX ID>",
-                  "target_ref": "<target STIX ID>",
-                },
-                ...
-              ]
             },
             ...
           ],
@@ -2918,6 +3185,8 @@ async def get_techniques_used_by_group_software(
         }
     """
     attack_data = get_attack_data(domain)
+    # Accept an ATT&CK ID (G####) as well as a STIX ID.
+    group_stix_id = _resolve_stix_id(attack_data, group_stix_id, "intrusion-set")
 
     # Optional: resolve group details for context
     try:
@@ -2954,6 +3223,7 @@ async def get_techniques_used_by_group_software(
 
     if not rel_entries:
         return {
+            **_paginate([], limit, offset)[1],
             "group": group_info,
             "count": 0,
             "techniques": [],
@@ -2964,73 +3234,45 @@ async def get_techniques_used_by_group_software(
             ),
         }
 
+    # The library returns plain technique objects here (no relationship wrappers).
     techniques_structured: List[Dict[str, Any]] = []
     technique_objects_for_format: List[Any] = []
 
-    for entry in rel_entries:
-        if isinstance(entry, dict):
-            tech_obj = entry.get("object")
-            rels = entry.get("relationships", [])
-        else:
-            tech_obj = getattr(entry, "object", None)
-            rels = getattr(entry, "relationships", [])
+    candidates = [_unwrap(e) for e in rel_entries]
+    candidates = [t for t in candidates if t is not None]
+    try:
+        candidates = list(attack_data.remove_revoked_deprecated(candidates))
+    except Exception:
+        candidates = [
+            t for t in candidates
+            if not (_field(t, "revoked", False) or _field(t, "x_mitre_deprecated", False))
+        ]
 
-        if tech_obj is None:
+    seen_ids = set()
+    for tech_obj in candidates:
+        t_stix_id = _field(tech_obj, "id")
+        if not t_stix_id or t_stix_id in seen_ids:
             continue
+        seen_ids.add(t_stix_id)
 
         technique_objects_for_format.append(tech_obj)
 
-        # Extract technique info
-        if isinstance(tech_obj, dict):
-            t_name = tech_obj.get("name")
-            t_stix_id = tech_obj.get("id")
-            t_desc = tech_obj.get("description") if include_description else None
-        else:
-            t_name = getattr(tech_obj, "name", None)
-            t_stix_id = getattr(tech_obj, "id", None)
-            t_desc = getattr(tech_obj, "description", None) if include_description else None
-
-        # External ATT&CK ID (TXXXX / TXXXX.YYY)
-        try:
-            t_attack_id = attack_data.get_attack_id(t_stix_id)
-        except Exception:
-            t_attack_id = None
-
-        # Relationship metadata
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
-
         techniques_structured.append(
             {
-                "attack_id": t_attack_id,
-                "name": t_name,
+                "attack_id": _safe_attack_id(attack_data, t_stix_id),
+                "name": _field(tech_obj, "name"),
                 "stix_id": t_stix_id,
-                "description": t_desc,
-                "relationships": relationships_info,
+                "description": _field(tech_obj, "description") if include_description else None,
             }
         )
+
+    # Sort the full list before slicing so pages are stable; `count` stays the total.
+    obj_by_id = {_field(o, "id"): o for o in technique_objects_for_format}
+    techniques_structured.sort(key=_item_sort_key)
+    page, page_meta = _paginate(techniques_structured, limit, offset)
+    technique_objects_for_format = [
+        obj_by_id[t["stix_id"]] for t in page if t["stix_id"] in obj_by_id
+    ]
 
     formatted = ""
     if technique_objects_for_format:
@@ -3043,7 +3285,8 @@ async def get_techniques_used_by_group_software(
     return {
         "group": group_info,
         "count": len(techniques_structured),
-        "techniques": techniques_structured,
+        "techniques": page,
+        **page_meta,
         "formatted": formatted,
         "message": (
             f"Found {len(techniques_structured)} technique(s) reachable via software "
@@ -3055,7 +3298,8 @@ async def get_techniques_used_by_group_software(
 async def get_groups_using_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
+    include_relationships: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all APT groups (intrusion sets) that use a specific technique.
@@ -3068,6 +3312,8 @@ async def get_groups_using_technique(
                            (e.g., "attack-pattern--UUID").
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include group descriptions.
+        include_relationships: If True, include the raw relationship records
+            (with relationship descriptions) per item; omitted by default.
 
     Returns:
         {
@@ -3189,30 +3435,7 @@ async def get_groups_using_technique(
         except Exception:
             g_attack_id = None
 
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
 
         groups_structured.append(
             {
@@ -3221,7 +3444,7 @@ async def get_groups_using_technique(
                 "aliases": g_aliases,
                 "stix_id": g_stix_id,
                 "description": g_desc,
-                "relationships": relationships_info,
+                **({"relationships": relationships_info} if include_relationships else {}),
             }
         )
 
@@ -3249,7 +3472,8 @@ async def get_groups_using_technique(
 async def get_groups_using_software(
     software_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
+    include_relationships: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all APT groups (intrusion sets) that use a specific software/malware.
@@ -3263,6 +3487,8 @@ async def get_groups_using_software(
                           (e.g., "malware--UUID", "tool--UUID").
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include group descriptions.
+        include_relationships: If True, include the raw relationship records
+            (with relationship descriptions) per item; omitted by default.
 
     Returns:
         {
@@ -3384,30 +3610,7 @@ async def get_groups_using_software(
         except Exception:
             g_attack_id = None
 
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
 
         groups_structured.append(
             {
@@ -3416,7 +3619,7 @@ async def get_groups_using_software(
                 "aliases": g_aliases,
                 "stix_id": g_stix_id,
                 "description": g_desc,
-                "relationships": relationships_info,
+                **({"relationships": relationships_info} if include_relationships else {}),
             }
         )
 
@@ -3443,7 +3646,8 @@ async def get_groups_using_software(
 async def get_groups_attributing_to_campaign(
     campaign_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
+    include_relationships: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all APT groups (intrusion sets) attributed to a specific campaign.
@@ -3456,6 +3660,8 @@ async def get_groups_attributing_to_campaign(
         campaign_stix_id: STIX ID of the campaign (e.g., "campaign--UUID").
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include group descriptions.
+        include_relationships: If True, include the raw relationship records
+            (with relationship descriptions) per item; omitted by default.
 
     Returns:
         {
@@ -3575,30 +3781,7 @@ async def get_groups_attributing_to_campaign(
         except Exception:
             g_attack_id = None
 
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
 
         groups_structured.append(
             {
@@ -3607,7 +3790,7 @@ async def get_groups_attributing_to_campaign(
                 "aliases": g_aliases,
                 "stix_id": g_stix_id,
                 "description": g_desc,
-                "relationships": relationships_info,
+                **({"relationships": relationships_info} if include_relationships else {}),
             }
         )
 
@@ -3637,7 +3820,7 @@ async def get_groups_attributing_to_campaign(
 async def get_software_by_alias(
     alias: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
     remove_revoked_deprecated: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -3754,7 +3937,8 @@ async def get_software_by_alias(
 async def get_software_using_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
+    include_relationships: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all software (malware/tools) that use a specific technique.
@@ -3768,6 +3952,8 @@ async def get_software_using_technique(
                            (e.g., "attack-pattern--UUID").
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include software descriptions.
+        include_relationships: If True, include the raw relationship records
+            (with relationship descriptions) per item; omitted by default.
 
     Returns:
         {
@@ -3888,31 +4074,7 @@ async def get_software_using_technique(
         except Exception:
             s_attack_id = None
 
-        # Relationship metadata (if present)
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
 
         software_structured.append(
             {
@@ -3921,7 +4083,7 @@ async def get_software_using_technique(
                 "stix_id": s_stix_id,
                 "type": s_type,
                 "description": s_desc,
-                "relationships": relationships_info,
+                **({"relationships": relationships_info} if include_relationships else {}),
             }
         )
 
@@ -3948,7 +4110,10 @@ async def get_software_using_technique(
 async def get_techniques_used_by_software(
     software_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
+    include_relationships: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all techniques used by specific software/malware.
@@ -3961,6 +4126,10 @@ async def get_techniques_used_by_software(
                           (e.g., "malware--UUID", "tool--UUID").
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include technique descriptions.
+        include_relationships: If True, include the raw relationship records
+            (with relationship descriptions) per item; omitted by default.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID.
+        offset: Number of items to skip (for paging with `limit`).
 
     Returns:
         {
@@ -4038,6 +4207,7 @@ async def get_techniques_used_by_software(
 
     if not rel_entries:
         return {
+            **_paginate([], limit, offset)[1],
             "software": software_info,
             "count": 0,
             "techniques": [],
@@ -4081,31 +4251,7 @@ async def get_techniques_used_by_software(
         except Exception:
             t_attack_id = None
 
-        # Relationship metadata
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
 
         techniques_structured.append(
             {
@@ -4113,9 +4259,17 @@ async def get_techniques_used_by_software(
                 "name": t_name,
                 "stix_id": t_stix_id,
                 "description": t_desc,
-                "relationships": relationships_info,
+                **({"relationships": relationships_info} if include_relationships else {}),
             }
         )
+
+    # Sort the full list before slicing so pages are stable; `count` stays the total.
+    obj_by_id = {_field(o, "id"): o for o in technique_objects_for_format}
+    techniques_structured.sort(key=_item_sort_key)
+    page, page_meta = _paginate(techniques_structured, limit, offset)
+    technique_objects_for_format = [
+        obj_by_id[t["stix_id"]] for t in page if t["stix_id"] in obj_by_id
+    ]
 
     formatted = ""
     if technique_objects_for_format:
@@ -4128,7 +4282,8 @@ async def get_techniques_used_by_software(
     return {
         "software": software_info,
         "count": len(techniques_structured),
-        "techniques": techniques_structured,
+        "techniques": page,
+        **page_meta,
         "formatted": formatted,
         "message": (
             f"Found {len(techniques_structured)} technique(s) used by software "
@@ -4145,6 +4300,8 @@ async def get_all_techniques(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK techniques for a given domain.
@@ -4153,6 +4310,8 @@ async def get_all_techniques(
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated techniques.
         include_description: Whether to include technique descriptions.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        offset: Number of items to skip (for paging with `limit`).
 
     Returns:
         {
@@ -4181,6 +4340,7 @@ async def get_all_techniques(
         )
     except Exception:
         return {
+            **_paginate([], limit, offset)[1],
             "domain": domain,
             "count": 0,
             "techniques": [],
@@ -4190,6 +4350,7 @@ async def get_all_techniques(
 
     if not techniques:
         return {
+            **_paginate([], limit, offset)[1],
             "domain": domain,
             "count": 0,
             "techniques": [],
@@ -4241,7 +4402,12 @@ async def get_all_techniques(
     # Formatted block (optional)
     formatted = ""
     if technique_objects_for_format:
-        formatted = format_objects(
+        total_found = len(structured)
+    structured, technique_objects_for_format, page_meta = _sort_and_page(
+        structured, technique_objects_for_format, limit, offset
+    )
+
+    formatted = format_objects(
             technique_objects_for_format,
             include_description=include_description,
             domain=domain,
@@ -4249,11 +4415,12 @@ async def get_all_techniques(
 
     return {
         "domain": domain,
-        "count": len(structured),
+        "count": total_found,
+        **page_meta,
         "techniques": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} technique(s) in domain '{domain}' "
+            f"Found {total_found} technique(s) in domain '{domain}' "
             f"(remove_revoked_deprecated={remove_revoked_deprecated})."
         ),
     }
@@ -4263,6 +4430,8 @@ async def get_all_subtechniques(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all subtechniques in a given ATT&CK domain.
@@ -4274,6 +4443,8 @@ async def get_all_subtechniques(
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated subtechniques.
         include_description: Whether to include descriptions.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        offset: Number of items to skip (for paging with `limit`).
 
     Returns:
         {
@@ -4306,6 +4477,7 @@ async def get_all_subtechniques(
         )
     except Exception:
         return {
+            **_paginate([], limit, offset)[1],
             "domain": domain,
             "count": 0,
             "subtechniques": [],
@@ -4389,6 +4561,7 @@ async def get_all_subtechniques(
 
     if not structured:
         return {
+            **_paginate([], limit, offset)[1],
             "domain": domain,
             "count": 0,
             "subtechniques": [],
@@ -4399,6 +4572,11 @@ async def get_all_subtechniques(
             ),
         }
 
+    total_found = len(structured)
+    structured, subtechnique_objects, page_meta = _sort_and_page(
+        structured, subtechnique_objects, limit, offset
+    )
+
     # Optional human-readable formatting using your existing helper
     formatted = format_objects(
         subtechnique_objects,
@@ -4408,11 +4586,12 @@ async def get_all_subtechniques(
 
     return {
         "domain": domain,
-        "count": len(structured),
+        "count": total_found,
+        **page_meta,
         "subtechniques": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} subtechnique(s) in domain '{domain}' "
+            f"Found {total_found} subtechnique(s) in domain '{domain}' "
             f"(remove_revoked_deprecated={remove_revoked_deprecated})."
         ),
     }
@@ -4422,6 +4601,8 @@ async def get_all_parent_techniques(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all parent techniques (exclude subtechniques) in a given domain.
@@ -4433,6 +4614,8 @@ async def get_all_parent_techniques(
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated techniques.
         include_description: Whether to include descriptions.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        offset: Number of items to skip (for paging with `limit`).
 
     Returns:
         {
@@ -4461,6 +4644,7 @@ async def get_all_parent_techniques(
         )
     except Exception:
         return {
+            **_paginate([], limit, offset)[1],
             "domain": domain,
             "count": 0,
             "parent_techniques": [],
@@ -4526,6 +4710,7 @@ async def get_all_parent_techniques(
 
     if not structured:
         return {
+            **_paginate([], limit, offset)[1],
             "domain": domain,
             "count": 0,
             "parent_techniques": [],
@@ -4536,6 +4721,11 @@ async def get_all_parent_techniques(
             ),
         }
 
+    total_found = len(structured)
+    structured, parent_objects, page_meta = _sort_and_page(
+        structured, parent_objects, limit, offset
+    )
+
     formatted = format_objects(
         parent_objects,
         include_description=include_description,
@@ -4544,11 +4734,12 @@ async def get_all_parent_techniques(
 
     return {
         "domain": domain,
-        "count": len(structured),
+        "count": total_found,
+        **page_meta,
         "parent_techniques": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} parent technique(s) in domain '{domain}' "
+            f"Found {total_found} parent technique(s) in domain '{domain}' "
             f"(remove_revoked_deprecated={remove_revoked_deprecated})."
         ),
     }
@@ -4558,6 +4749,8 @@ async def get_all_groups(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all APT groups (intrusion sets) in a domain.
@@ -4566,6 +4759,8 @@ async def get_all_groups(
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated groups.
         include_description: Whether to include descriptions.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        offset: Number of items to skip (for paging with `limit`).
 
     Returns:
         {
@@ -4594,6 +4789,7 @@ async def get_all_groups(
         )
     except Exception:
         return {
+            **_paginate([], limit, offset)[1],
             "domain": domain,
             "count": 0,
             "groups": [],
@@ -4603,6 +4799,7 @@ async def get_all_groups(
 
     if not groups:
         return {
+            **_paginate([], limit, offset)[1],
             "domain": domain,
             "count": 0,
             "groups": [],
@@ -4646,6 +4843,11 @@ async def get_all_groups(
             }
         )
 
+    total_found = len(structured)
+    structured, groups_for_format, page_meta = _sort_and_page(
+        structured, groups_for_format, limit, offset
+    )
+
     # Optional formatted human-readable block
     formatted = format_objects(
         groups_for_format,
@@ -4655,11 +4857,12 @@ async def get_all_groups(
 
     return {
         "domain": domain,
-        "count": len(structured),
+        "count": total_found,
+        **page_meta,
         "groups": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} APT group(s) in domain '{domain}' "
+            f"Found {total_found} APT group(s) in domain '{domain}' "
             f"(remove_revoked_deprecated={remove_revoked_deprecated})."
         ),
     }
@@ -4669,6 +4872,8 @@ async def get_all_software(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all software (malware and tools) in a domain.
@@ -4680,6 +4885,8 @@ async def get_all_software(
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated software.
         include_description: Whether to include descriptions.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        offset: Number of items to skip (for paging with `limit`).
 
     Returns:
         {
@@ -4709,6 +4916,7 @@ async def get_all_software(
         )
     except Exception:
         return {
+            **_paginate([], limit, offset)[1],
             "domain": domain,
             "count": 0,
             "software": [],
@@ -4718,6 +4926,7 @@ async def get_all_software(
 
     if not software_items:
         return {
+            **_paginate([], limit, offset)[1],
             "domain": domain,
             "count": 0,
             "software": [],
@@ -4764,6 +4973,11 @@ async def get_all_software(
             }
         )
 
+    total_found = len(structured)
+    structured, software_for_format, page_meta = _sort_and_page(
+        structured, software_for_format, limit, offset
+    )
+
     # Optional human-readable formatted view
     formatted = format_objects(
         software_for_format,
@@ -4773,11 +4987,12 @@ async def get_all_software(
 
     return {
         "domain": domain,
-        "count": len(structured),
+        "count": total_found,
+        **page_meta,
         "software": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} software object(s) in domain '{domain}' "
+            f"Found {total_found} software object(s) in domain '{domain}' "
             f"(remove_revoked_deprecated={remove_revoked_deprecated})."
         ),
     }
@@ -4786,7 +5001,7 @@ async def get_all_software(
 async def get_all_mitigations(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all mitigations (defensive countermeasures) in a domain.
@@ -4890,7 +5105,7 @@ async def get_all_mitigations(
 @mcp.tool()
 async def get_all_tactics(
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK tactics for a domain.
@@ -4989,7 +5204,7 @@ async def get_all_tactics(
 async def get_all_matrices(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK matrices in a domain.
@@ -5095,7 +5310,7 @@ async def get_all_matrices(
 async def get_all_campaigns(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK campaigns in a domain.
@@ -5206,7 +5421,7 @@ async def get_all_campaigns(
 async def get_all_datasources(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK data sources in a domain.
@@ -5312,7 +5527,7 @@ async def get_all_datasources(
 async def get_all_datacomponents(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK data components in a domain.
@@ -5452,7 +5667,7 @@ async def get_all_datacomponents(
 async def get_all_assets(
     domain: str = "ics",
     remove_revoked_deprecated: bool = True,
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK assets in a domain (primarily ICS).
@@ -5562,7 +5777,7 @@ async def get_all_assets(
 async def get_assets_targeted_by_technique(
     technique_stix_id: str,
     domain: str = "ics",
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all ICS assets targeted by a specific technique.
@@ -5683,7 +5898,7 @@ async def get_assets_targeted_by_technique(
 async def get_techniques_targeting_asset(
     asset_stix_id: str,
     domain: str = "ics",
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all techniques that target a specific ICS asset.
@@ -5774,7 +5989,8 @@ async def get_techniques_targeting_asset(
 async def get_campaigns_using_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
+    include_relationships: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all campaigns that use a specific technique.
@@ -5786,6 +6002,8 @@ async def get_campaigns_using_technique(
                            (e.g., 'attack-pattern--UUID').
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include campaign descriptions.
+        include_relationships: If True, include the raw relationship records
+            (with relationship descriptions) per item; omitted by default.
 
     Returns:
         {
@@ -5903,31 +6121,7 @@ async def get_campaigns_using_technique(
         except Exception:
             c_attack_id = None
 
-        # Relationship metadata (if available)
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
 
         campaigns_structured.append(
             {
@@ -5935,7 +6129,7 @@ async def get_campaigns_using_technique(
                 "name": c_name,
                 "stix_id": c_stix_id,
                 "description": c_desc,
-                "relationships": relationships_info,
+                **({"relationships": relationships_info} if include_relationships else {}),
             }
         )
 
@@ -5963,7 +6157,8 @@ async def get_campaigns_using_technique(
 async def get_techniques_used_by_campaign(
     campaign_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
+    include_relationships: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all techniques used in a specific campaign.
@@ -5973,6 +6168,8 @@ async def get_techniques_used_by_campaign(
                           (e.g., 'campaign--UUID').
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include technique descriptions.
+        include_relationships: If True, include the raw relationship records
+            (with relationship descriptions) per item; omitted by default.
 
     Returns:
         {
@@ -6102,31 +6299,7 @@ async def get_techniques_used_by_campaign(
             if phase_name:
                 tactics.append(phase_name.replace("-", " ").title())
 
-        # Relationship metadata
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
 
         techniques_structured.append(
             {
@@ -6135,7 +6308,7 @@ async def get_techniques_used_by_campaign(
                 "stix_id": t_stix_id,
                 "description": t_desc,
                 "tactics": tactics,
-                "relationships": relationships_info,
+                **({"relationships": relationships_info} if include_relationships else {}),
             }
         )
 
@@ -6163,7 +6336,8 @@ async def get_techniques_used_by_campaign(
 async def get_campaigns_using_software(
     software_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
+    include_relationships: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all campaigns that use specific software/malware.
@@ -6174,6 +6348,8 @@ async def get_campaigns_using_software(
         software_stix_id: Software STIX UUID identifier (e.g., 'malware--UUID', 'tool--UUID').
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include campaign descriptions.
+        include_relationships: If True, include the raw relationship records
+            (with relationship descriptions) per item; omitted by default.
 
     Returns:
         {
@@ -6294,31 +6470,7 @@ async def get_campaigns_using_software(
         except Exception:
             c_attack_id = None
 
-        # Relationship metadata
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
 
         campaigns_structured.append(
             {
@@ -6326,7 +6478,7 @@ async def get_campaigns_using_software(
                 "name": c_name,
                 "stix_id": c_stix_id,
                 "description": c_desc,
-                "relationships": relationships_info,
+                **({"relationships": relationships_info} if include_relationships else {}),
             }
         )
 
@@ -6354,7 +6506,8 @@ async def get_campaigns_using_software(
 async def get_software_used_by_campaign(
     campaign_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
+    include_relationships: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all software/malware used in a specific campaign.
@@ -6363,6 +6516,8 @@ async def get_software_used_by_campaign(
         campaign_stix_id: Campaign STIX UUID identifier (e.g., 'campaign--UUID').
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include software descriptions.
+        include_relationships: If True, include the raw relationship records
+            (with relationship descriptions) per item; omitted by default.
 
     Returns:
         {
@@ -6485,31 +6640,7 @@ async def get_software_used_by_campaign(
         except Exception:
             s_attack_id = None
 
-        # Relationship metadata
-        relationships_info = []
-        for r in rels:
-            if isinstance(r, dict):
-                r_id = r.get("id")
-                r_type = r.get("relationship_type")
-                r_desc = r.get("description")
-                r_source = r.get("source_ref")
-                r_target = r.get("target_ref")
-            else:
-                r_id = getattr(r, "id", None)
-                r_type = getattr(r, "relationship_type", None)
-                r_desc = getattr(r, "description", None)
-                r_source = getattr(r, "source_ref", None)
-                r_target = getattr(r, "target_ref", None)
-
-            relationships_info.append(
-                {
-                    "stix_id": r_id,
-                    "relationship_type": r_type,
-                    "description": r_desc,
-                    "source_ref": r_source,
-                    "target_ref": r_target,
-                }
-            )
+        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
 
         software_structured.append(
             {
@@ -6519,7 +6650,7 @@ async def get_software_used_by_campaign(
                 "type": s_type,
                 "aliases": s_aliases,
                 "description": s_desc,
-                "relationships": relationships_info,
+                **({"relationships": relationships_info} if include_relationships else {}),
             }
         )
 
@@ -6551,8 +6682,10 @@ async def get_software_used_by_campaign(
 async def get_techniques_by_platform(
     platform: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
     remove_revoked_deprecated: bool = True,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK techniques that apply to a specific platform.
@@ -6563,6 +6696,8 @@ async def get_techniques_by_platform(
                   'Office Suite', 'Containers', 'ESXi', 'Network Devices'.
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include technique descriptions.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        offset: Number of items to skip (for paging with `limit`).
         remove_revoked_deprecated: Exclude revoked/deprecated techniques (default True).
 
     Returns:
@@ -6594,6 +6729,7 @@ async def get_techniques_by_platform(
 
     if not techniques:
         return {
+            **_paginate([], limit, offset)[1],
             "platform": platform,
             "count": 0,
             "techniques": [],
@@ -6630,6 +6766,11 @@ async def get_techniques_by_platform(
             }
         )
 
+    total_found = len(structured)
+    structured, techniques, page_meta = _sort_and_page(
+        structured, techniques, limit, offset
+    )
+
     # optional human-readable formatting
     formatted = format_objects(
         techniques,
@@ -6639,11 +6780,12 @@ async def get_techniques_by_platform(
 
     return {
         "platform": platform,
-        "count": len(structured),
+        "count": total_found,
+        **page_meta,
         "techniques": structured,
         "formatted": formatted,
         "message": (
-            f"Found {len(structured)} technique(s) applicable to platform "
+            f"Found {total_found} technique(s) applicable to platform "
             f"'{platform}' in domain '{domain}'."
         ),
     }
@@ -7147,16 +7289,24 @@ def get_datacomponents_detecting_technique(
     Primary mode:
       - Use mitreattack-python relationship traversal (if present)
 
-    Fallback mode (when relationship traversal yields 0):
+    Detection-strategy mode (ATT&CK v18+, used when no legacy `detects` relationship exists):
+      - technique -> detection strategy (DET) -> analytic (AN) -> log-source data components.
+      - Each data component lists the DET and AN IDs that reference it plus the log sources.
+
+    Fallback mode (when both of the above yield 0):
       - Read technique.x_mitre_data_sources (strings)
       - Resolve data source objects by name
       - Return data components whose x_mitre_data_source_ref points to those data sources
       - If the string includes a component name (e.g., "Process: Process Creation"),
         filter to that component when possible.
 
-    Returns the same structure as before, plus a debug block.
+    Accepts a STIX ID or an ATT&CK ID for the technique.
+    Returns the same structure as before (plus attack_id, detection_strategies, analytics and
+    log_sources per data component) and a debug block.
     """
     attack_data = get_attack_data(domain)
+    # Accept an ATT&CK ID (e.g. "T1552.005") as well as a STIX ID.
+    technique_stix_id = _resolve_stix_id(attack_data, technique_stix_id, "attack-pattern")
 
     def _get_attr(obj, name, default=None):
         if obj is None:
@@ -7182,7 +7332,7 @@ def get_datacomponents_detecting_technique(
             "attack_id": attack_id,
             "name": name,
             "stix_id": stix_id,
-            "description": desc if include_description else (desc[:120] + "..." if isinstance(desc, str) and len(desc) > 120 else desc),
+            "description": desc if include_description else None,
         }
 
     # ---------- 1) Load technique ----------
@@ -7234,9 +7384,13 @@ def get_datacomponents_detecting_technique(
 
                 datacomponents_structured.append(
                     {
+                        "attack_id": _safe_attack_id(attack_data, dc_stix),
                         "name": dc_name,
                         "stix_id": dc_stix,
                         "description": dc_desc if include_description else None,
+                        "detection_strategies": [],
+                        "analytics": [],
+                        "log_sources": [],
                         "data_source_stix_id": ds_ref,
                         "data_source_name": ds_name,
                         "data_source_attack_id": ds_attack_id,
@@ -7257,6 +7411,68 @@ def get_datacomponents_detecting_technique(
     except Exception:
         # ignore and fall back
         pass
+
+    # ---------- 2b) Detection strategy chain (only when the legacy path found nothing) ----------
+    if not datacomponents_structured and tech_obj is not None:
+        try:
+            chain = attack_data.detection_chain_for_technique(technique_stix_id)
+        except Exception:
+            chain = []
+        by_dc: Dict[str, Dict[str, Any]] = {}
+        for link in chain:
+            det = link["detection_strategy"]
+            det_aid = _safe_attack_id(attack_data, _field(det, "id"))
+            for an in link["analytics"]:
+                an_aid = _safe_attack_id(attack_data, _field(an, "id"))
+                for ref in _field(an, "x_mitre_log_source_references") or []:
+                    dc_ref = _field(ref, "x_mitre_data_component_ref")
+                    if not dc_ref:
+                        continue
+                    rec = by_dc.setdefault(
+                        dc_ref,
+                        {"detection_strategies": [], "analytics": [], "log_sources": []},
+                    )
+                    if det_aid and det_aid not in rec["detection_strategies"]:
+                        rec["detection_strategies"].append(det_aid)
+                    if an_aid and an_aid not in rec["analytics"]:
+                        rec["analytics"].append(an_aid)
+                    ls = {"name": _field(ref, "name"), "channel": _field(ref, "channel")}
+                    if ls not in rec["log_sources"]:
+                        rec["log_sources"].append(ls)
+        for dc_ref, rec in by_dc.items():
+            try:
+                dc_obj = attack_data.get_object_by_stix_id(dc_ref)
+            except Exception:
+                dc_obj = None
+            if dc_obj is None or _get_attr(dc_obj, "revoked") or _get_attr(dc_obj, "x_mitre_deprecated"):
+                continue
+            ds_ref = _get_attr(dc_obj, "x_mitre_data_source_ref")
+            ds_name = None
+            ds_attack_id = None
+            if ds_ref:
+                try:
+                    ds_name = _get_attr(attack_data.get_object_by_stix_id(ds_ref), "name")
+                except Exception:
+                    ds_name = None
+                ds_attack_id = _safe_attack_id(attack_data, ds_ref)
+            dc_desc = _get_attr(dc_obj, "description")
+            datacomponents_structured.append(
+                {
+                    "attack_id": _safe_attack_id(attack_data, dc_ref),
+                    "name": _get_attr(dc_obj, "name"),
+                    "stix_id": dc_ref,
+                    "description": dc_desc if include_description else None,
+                    "detection_strategies": rec["detection_strategies"],
+                    "analytics": rec["analytics"],
+                    "log_sources": rec["log_sources"],
+                    "data_source_stix_id": ds_ref,
+                    "data_source_name": ds_name,
+                    "data_source_attack_id": ds_attack_id,
+                    "relationships": [],
+                }
+            )
+        if datacomponents_structured:
+            debug["query_mode"] = "detection_strategy_analytics"
 
     # ---------- 3) Fallback: x_mitre_data_sources mapping ----------
     if not datacomponents_structured and tech_obj is not None:
@@ -7335,9 +7551,13 @@ def get_datacomponents_detecting_technique(
 
                 datacomponents_structured.append(
                     {
+                        "attack_id": _safe_attack_id(attack_data, dc_stix),
                         "name": dc_name,
                         "stix_id": dc_stix,
                         "description": dc_desc if include_description else None,
+                        "detection_strategies": [],
+                        "analytics": [],
+                        "log_sources": [],
                         "data_source_stix_id": ds_stix,
                         "data_source_name": _get_attr(ds_obj, "name"),
                         "data_source_attack_id": ds_attack_id,
@@ -7392,7 +7612,7 @@ def get_datacomponents_detecting_technique(
 async def get_techniques_detected_by_datacomponent(
     datacomponent_stix_id: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all techniques that can be detected by a specific data component.
@@ -7402,7 +7622,7 @@ async def get_techniques_detected_by_datacomponent(
 
     Args:
         datacomponent_stix_id: Data component STIX UUID identifier
-                               (e.g., 'x-mitre-data-component--UUID').
+                               (e.g., 'x-mitre-data-component--UUID') or ATT&CK ID (e.g., 'DC0070').
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include technique descriptions.
 
@@ -7434,6 +7654,9 @@ async def get_techniques_detected_by_datacomponent(
         }
     """
     attack_data = get_attack_data(domain)
+    datacomponent_stix_id = _resolve_stix_id(
+        attack_data, datacomponent_stix_id, "x-mitre-data-component"
+    )
 
     # --- Resolve data component metadata ---
     try:
@@ -7501,6 +7724,20 @@ async def get_techniques_detected_by_datacomponent(
     except Exception:
         techniques = []
 
+    # Detection-strategy chain: only when the wrapper path is empty (never merged).
+    chain_links: Dict[str, Tuple[List[str], List[str]]] = {}
+    if not techniques:
+        try:
+            chain = attack_data.techniques_for_datacomponent(datacomponent_stix_id)
+        except Exception:
+            chain = []
+        for tech, det_ids, an_ids in chain:
+            techniques.append(tech)
+            chain_links[_field(tech, "id")] = (
+                [_safe_attack_id(attack_data, d) for d in det_ids if _safe_attack_id(attack_data, d)],
+                [_safe_attack_id(attack_data, a) for a in an_ids if _safe_attack_id(attack_data, a)],
+            )
+
     if not techniques:
         return {
             "datacomponent": datacomponent_info,
@@ -7525,12 +7762,15 @@ async def get_techniques_detected_by_datacomponent(
         except Exception:
             t_attack_id = None
 
+        det_aids, an_aids = chain_links.get(t_stix, ([], []))
         technique_entries.append(
             {
                 "attack_id": t_attack_id,
                 "name": t_name,
                 "stix_id": t_stix,
                 "description": t_desc,
+                "detection_strategies": det_aids,
+                "analytics": an_aids,
             }
         )
 
@@ -7552,6 +7792,153 @@ async def get_techniques_detected_by_datacomponent(
             f"Found {len(technique_entries)} technique(s) that can be detected by "
             f"data component STIX ID '{datacomponent_stix_id}' in domain '{domain}'."
         ),
+    }
+
+
+@mcp.tool()
+async def get_detection_strategies_for_technique(
+    technique_id: str,
+    domain: str = "enterprise",
+    platform: Optional[str] = None,
+    include_description: bool = False,
+) -> Dict[str, Any]:
+    """
+    Get the detection strategies, analytics and log sources that detect a technique (ATT&CK v18+).
+
+    Chain: technique -> detection strategy (DET####) -> analytics (AN####) -> log sources
+    (data component DC#### + log source name/channel).
+
+    Args:
+        technique_id: Technique ATT&CK ID (e.g., "T1552.005") or STIX ID.
+        domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas'). ATLAS has no
+                detection strategies and returns count 0.
+        platform: Optional platform filter (case-insensitive), matched against the analytic
+                  platforms (e.g., "Windows", "IaaS"). Strategies left without analytics are dropped.
+        include_description: Include technique/analytic descriptions and mutable elements.
+
+    Returns:
+        {
+          "technique": {"attack_id", "name", "stix_id", "description"?} | null,
+          "count": <number of detection strategies>,
+          "detection_strategies": [
+            {"attack_id": "DET####", "name", "stix_id",
+             "analytics": [{"attack_id": "AN####", "name", "stix_id", "platforms": [...],
+                            "log_sources": [{"data_component_attack_id",
+                                             "data_component_name",
+                                             "data_component_stix_id", "name", "channel"}],
+                            "mutable_elements"?, "description"?}]}
+          ],
+          "formatted": "<human-readable summary>",
+          "message": "<status>"
+        }
+    """
+    attack_data = get_attack_data(domain)
+    tech_stix = _resolve_stix_id(attack_data, technique_id, "attack-pattern")
+    try:
+        tech = attack_data.get_object_by_stix_id(tech_stix)
+    except Exception:
+        tech = None
+
+    # Only attack-pattern objects are techniques; other STIX types get the not-found response.
+    if tech is not None and _field(tech, "type") != "attack-pattern":
+        tech = None
+
+    if tech is None:
+        return {
+            "technique": None,
+            "count": 0,
+            "detection_strategies": [],
+            "formatted": "",
+            "message": f"Technique '{technique_id}' not found in domain '{domain}'.",
+        }
+
+    technique_info: Dict[str, Any] = {
+        "attack_id": _safe_attack_id(attack_data, _field(tech, "id")),
+        "name": _field(tech, "name"),
+        "stix_id": _field(tech, "id"),
+    }
+    if include_description:
+        technique_info["description"] = _field(tech, "description")
+
+    wanted = platform.strip().lower() if platform and platform.strip() else None
+    strategies: List[Dict[str, Any]] = []
+    for link in attack_data.detection_chain_for_technique(_field(tech, "id")):
+        det = link["detection_strategy"]
+        analytics_out: List[Dict[str, Any]] = []
+        for an in link["analytics"]:
+            platforms = list(_field(an, "x_mitre_platforms") or [])
+            if wanted and wanted not in [str(p).lower() for p in platforms]:
+                continue
+            log_sources: List[Dict[str, Any]] = []
+            for ref in _field(an, "x_mitre_log_source_references") or []:
+                dc_ref = _field(ref, "x_mitre_data_component_ref")
+                dc_obj = None
+                if dc_ref:
+                    try:
+                        dc_obj = attack_data.get_object_by_stix_id(dc_ref)
+                    except Exception:
+                        dc_obj = None
+                log_sources.append(
+                    {
+                        "data_component_attack_id": _safe_attack_id(attack_data, dc_ref),
+                        "data_component_name": _field(dc_obj, "name") if dc_obj is not None else None,
+                        "data_component_stix_id": dc_ref,
+                        "name": _field(ref, "name"),
+                        "channel": _field(ref, "channel"),
+                    }
+                )
+            entry: Dict[str, Any] = {
+                "attack_id": _safe_attack_id(attack_data, _field(an, "id")),
+                "name": _field(an, "name"),
+                "stix_id": _field(an, "id"),
+                "platforms": platforms,
+                "log_sources": log_sources,
+            }
+            if include_description:
+                entry["mutable_elements"] = list(_field(an, "x_mitre_mutable_elements") or [])
+                entry["description"] = _field(an, "description")
+            analytics_out.append(entry)
+        if wanted and not analytics_out:
+            continue
+        strategies.append(
+            {
+                "attack_id": _safe_attack_id(attack_data, _field(det, "id")),
+                "name": _field(det, "name"),
+                "stix_id": _field(det, "id"),
+                "analytics": analytics_out,
+            }
+        )
+
+    lines: List[str] = []
+    for st in strategies:
+        lines.append(f"{st['attack_id']}: {st['name']}")
+        for an in st["analytics"]:
+            lines.append(f"  {an['attack_id']} [{', '.join(an['platforms'])}]")
+            for ls in an["log_sources"]:
+                lines.append(
+                    f"    - {ls['data_component_attack_id']} {ls['data_component_name']}"
+                    f" ({ls['name']}, {ls['channel']})"
+                )
+
+    if strategies:
+        message = (
+            f"Found {len(strategies)} detection strategy(ies) for "
+            f"{technique_info['attack_id'] or technique_id} in domain '{domain}'."
+        )
+    else:
+        message = (
+            f"No detection strategies found for {technique_info['attack_id'] or technique_id} "
+            f"in domain '{domain}'"
+            + (f" and platform '{platform}'" if wanted else "")
+            + ". This domain or ATT&CK release may not define detection strategies."
+        )
+
+    return {
+        "technique": technique_info,
+        "count": len(strategies),
+        "detection_strategies": strategies,
+        "formatted": "\n".join(lines),
+        "message": message,
     }
 
 # ---------------------------------------------------------------------------
@@ -7884,6 +8271,8 @@ async def get_objects_by_type(
     domain: str = "enterprise",
     remove_revoked_deprecated: bool = True,
     include_description: bool = False,
+    limit: Optional[int] = None,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all objects of a specific STIX type.
@@ -7910,6 +8299,8 @@ async def get_objects_by_type(
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas', ...).
         remove_revoked_deprecated: Exclude revoked/deprecated objects.
         include_description: Include object descriptions in output.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        offset: Number of items to skip (for paging with `limit`).
 
     Returns:
         {
@@ -7941,6 +8332,7 @@ async def get_objects_by_type(
 
     if not objs:
         return {
+            **_paginate([], limit, offset)[1],
             "stix_type": stix_type,
             "domain": domain,
             "count": 0,
@@ -7978,6 +8370,11 @@ async def get_objects_by_type(
             }
         )
 
+    total_found = len(entries)
+    entries, objs, page_meta = _sort_and_page(
+        entries, objs, limit, offset
+    )
+
     formatted = format_objects(
         objs,
         include_description=include_description,
@@ -7987,11 +8384,12 @@ async def get_objects_by_type(
     return {
         "stix_type": stix_type,
         "domain": domain,
-        "count": len(entries),
+        "count": total_found,
+        **page_meta,
         "objects": entries,
         "formatted": formatted,
         "message": (
-            f"Found {len(entries)} object(s) of type '{stix_type}' in "
+            f"Found {total_found} object(s) of type '{stix_type}' in "
             f"domain '{domain}' "
             f"(remove_revoked_deprecated={remove_revoked_deprecated})."
         ),
@@ -8165,8 +8563,10 @@ async def get_tactics_by_technique(
 async def get_objects_created_after(
     timestamp: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
     remove_revoked_deprecated: bool = True,
+    limit: Optional[int] = 100,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK objects created after a specific timestamp.
@@ -8174,6 +8574,10 @@ async def get_objects_created_after(
     Useful for detecting new additions to the framework.
     Timestamp must be ISO8601 format, e.g., '2024-01-01T00:00:00Z'.
     Revoked/deprecated objects are excluded unless remove_revoked_deprecated=False.
+
+    Args:
+        limit: Maximum items to return (default 100; null = no limit, 0 = count only). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        offset: Number of items to skip (for paging with `limit`).
 
     Returns:
         {
@@ -8202,6 +8606,7 @@ async def get_objects_created_after(
         ) or []
     except Exception as e:
         return {
+            **_paginate([], limit, offset)[1],
             "found": False,
             "count": 0,
             "objects": [],
@@ -8211,6 +8616,7 @@ async def get_objects_created_after(
 
     if not objects:
         return {
+            **_paginate([], limit, offset)[1],
             "found": False,
             "count": 0,
             "objects": [],
@@ -8239,23 +8645,31 @@ async def get_objects_created_after(
             }
         )
 
+    total_found = len(results)
+    results, objects, page_meta = _sort_and_page(
+        results, objects, limit, offset
+    )
+
     # Pretty printed human-friendly block
     formatted = format_objects(objects, include_description=include_description, domain=domain)
 
     return {
         "found": True,
-        "count": len(results),
+        "count": total_found,
+        **page_meta,
         "objects": results,
         "formatted": formatted,
-        "message": f"Found {len(results)} objects created after {timestamp}.",
+        "message": f"Found {total_found} objects created after {timestamp}.",
     }
 
 @mcp.tool()
 async def get_objects_modified_after(
     timestamp: str,
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
     remove_revoked_deprecated: bool = True,
+    limit: Optional[int] = 100,
+    offset: int = 0,
 ) -> Dict[str, Any]:
     """
     Get all ATT&CK objects modified after a specific timestamp.
@@ -8263,6 +8677,10 @@ async def get_objects_modified_after(
     Useful for tracking updates and changes to the ATT&CK framework.
     Timestamp must be ISO8601 format, e.g., '2024-01-01T00:00:00Z'.
     Revoked/deprecated objects are excluded unless remove_revoked_deprecated=False.
+
+    Args:
+        limit: Maximum items to return (default 100; null = no limit, 0 = count only). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        offset: Number of items to skip (for paging with `limit`).
 
     Returns:
         {
@@ -8291,6 +8709,7 @@ async def get_objects_modified_after(
         ) or []
     except Exception as e:
         return {
+            **_paginate([], limit, offset)[1],
             "found": False,
             "count": 0,
             "objects": [],
@@ -8300,6 +8719,7 @@ async def get_objects_modified_after(
 
     if not objects:
         return {
+            **_paginate([], limit, offset)[1],
             "found": False,
             "count": 0,
             "objects": [],
@@ -8327,6 +8747,11 @@ async def get_objects_modified_after(
             }
         )
 
+    total_found = len(results)
+    results, objects, page_meta = _sort_and_page(
+        results, objects, limit, offset
+    )
+
     # Human-readable formatted output
     formatted = format_objects(
         objects,
@@ -8336,16 +8761,17 @@ async def get_objects_modified_after(
 
     return {
         "found": True,
-        "count": len(results),
+        "count": total_found,
+        **page_meta,
         "objects": results,
         "formatted": formatted,
-        "message": f"Found {len(results)} objects modified after {timestamp}.",
+        "message": f"Found {total_found} objects modified after {timestamp}.",
     }
 
 @mcp.tool()
 async def get_revoked_techniques(
     domain: str = "enterprise",
-    include_description: bool = True,
+    include_description: bool = False,
 ) -> Dict[str, Any]:
     """
     Get all revoked techniques for a domain.
@@ -8423,145 +8849,520 @@ async def get_revoked_techniques(
         "message": f"Found {len(output_items)} revoked techniques in '{domain}'.",
     }
 
+_LAYER_ID_RE = re.compile(r"^(?:[GMS]\d{4}|DC\d{4})$")
+
+
+def _layer_failure(attack_id: str, domain: str, message: str) -> Dict[str, Any]:
+    """Failure response shared by generate_layer branches."""
+    return {
+        "success": False,
+        "attack_id": attack_id,
+        "domain": domain,
+        "count": 0,
+        "layer": None,
+        "message": message,
+    }
+
+
 @mcp.tool()
 async def generate_layer(
     attack_id: str,
     score: int = 1,
     domain: str = "enterprise",
+    include_campaigns: bool = True,
+    include_comments: bool = False,
+    save_to_file: bool = False,
 ) -> Dict[str, Any]:
     """
     Generate an ATT&CK Navigator layer for visualization.
 
-    This wraps mitreattack.navlayers.UsageLayerGenerator and produces a
-    JSON layer highlighting techniques associated with a given ATT&CK ID.
+    Builds a layer from the loaded ATT&CK data highlighting techniques associated with a given
+    ATT&CK ID. Supported ID prefixes:
+      - Gxxxx  : groups (intrusion sets); includes techniques inherited through campaigns
+      - Mxxxx  : mitigations (techniques mitigated)
+      - Sxxxx  : software (techniques used)
+      - DCxxxx : data components (techniques detected via detection strategies)
 
-    Only the following ATT&CK ID prefixes are supported:
-      - Gxxxx : groups (intrusion sets)
-      - Mxxxx : mitigations (course-of-action)
-      - Sxxxx : software (tool/malware)
-      - Dxxxx : data components
-
-    Technique IDs (Txxxx / Txxxx.xxx) are NOT supported here.
+    Technique IDs (Txxxx / Txxxx.xxx) are NOT supported here; use generate_technique_layer.
+    Layer entries carry no `tactic`, so they apply under every tactic of the technique.
 
     Args:
-        attack_id: ATT&CK ID (Gxxxx, Mxxxx, Sxxxx, or Dxxxx)
-        score: Score to assign to all matched techniques in the layer
-        domain: ATT&CK domain (e.g., "enterprise", "mobile", "ics"). "atlas" is
-                rejected: ATLAS has no groups/software; use ATLAS Navigator.
+        attack_id: ATT&CK ID (Gxxxx, Mxxxx, Sxxxx, or DCxxxx).
+        score: Score to assign to all matched techniques in the layer.
+        domain: "enterprise", "mobile" or "ics". "atlas" is not supported (use
+                generate_technique_layer with domain="atlas").
+        include_campaigns: Groups only. True (default) includes techniques the group inherits
+                through attributed campaigns (commented "via campaign Cxxxx"); False keeps only
+                directly used techniques.
+        include_comments: If True, add the technique description (plus provenance) as the
+                per-technique comment. Default False keeps the layer small.
+        save_to_file: If True, write the layer under the server's layer directory
+                (MITRE_MCP_LAYER_DIR) and return `layer_path` instead of the layer.
 
     Returns:
         {
           "success": bool,
-          "attack_id": "<G/M/S/D ID>",
+          "attack_id": "<ID>",
           "domain": "<domain>",
-          "count": int,              # number of techniques in layer
+          "count": int,              # techniques in the layer (auto-added parents excluded)
           "layer": { ... } | null,   # ATT&CK Navigator layer JSON
+          "layer_path": "<abs path>" | null,   # present on success
+          "auto_added_parents": [...],         # present on success
           "message": "<summary or error>"
         }
     """
-    import re
+    raw_id = attack_id
+    attack_id = (attack_id or "").strip().upper()
+    domain = (domain or "").strip().lower()
 
-    from mitreattack.navlayers import UsageLayerGenerator
+    if not _valid_score(score):
+        return _layer_failure(raw_id, domain, "`score` must be a finite number (not a boolean).")
 
-    # ATLAS has no groups/software and the layer generator only knows ATT&CK domains.
     if domain == "atlas":
-        return {
-            "success": False,
-            "attack_id": attack_id,
-            "domain": domain,
-            "count": 0,
-            "layer": None,
-            "message": (
-                "ATLAS layers not supported: ATLAS has no groups/software; "
-                "use ATLAS Navigator."
-            ),
-        }
-
-    # Validate ATT&CK ID format: must be Gxxx/Mxxx/Sxxx/Dxxx
-    if not re.match(r"^[GMSD]\d+$", attack_id):
-        return {
-            "success": False,
-            "attack_id": attack_id,
-            "domain": domain,
-            "count": 0,
-            "layer": None,
-            "message": (
-                f"Invalid ATT&CK ID format: '{attack_id}'. Must be "
-                "GXXX (group), MXXX (mitigation), SXXX (software), or DXXX (data component). "
-                "Technique IDs (TXXX) are not supported."
-            ),
-        }
-
-    # Use the shared path helpers so behavior matches downloads + other tools
-    stix_path = get_stix_path(domain)
-
-    if not stix_path.exists():
-        return {
-            "success": False,
-            "attack_id": attack_id,
-            "domain": domain,
-            "count": 0,
-            "layer": None,
-            "message": (
-                f"STIX data file not found at '{stix_path}'. "
-                "Make sure data has been downloaded for this domain."
-            ),
-        }
-
-    # Generate Navigator layer
-    try:
-        generator = UsageLayerGenerator(
-            source="local",
-            domain=domain,
-            resource=str(stix_path),
+        return _layer_failure(
+            raw_id,
+            domain,
+            "generate_layer does not support ATLAS; use generate_technique_layer"
+            "(domain=\"atlas\") instead.",
+        )
+    if domain not in ("enterprise", "mobile", "ics"):
+        return _layer_failure(
+            raw_id, domain, "Invalid domain. Must be one of: enterprise, mobile, ics."
+        )
+    if re.match(r"^T\d+", attack_id):
+        return _layer_failure(
+            raw_id,
+            domain,
+            f"Technique IDs are not supported by generate_layer ('{raw_id}'); "
+            "use generate_technique_layer.",
+        )
+    if not _LAYER_ID_RE.match(attack_id):
+        return _layer_failure(
+            raw_id,
+            domain,
+            f"Invalid ATT&CK ID format: '{raw_id}'. Must be GXXXX (group), MXXXX (mitigation), "
+            "SXXXX (software), or DCXXXX (data component). "
+            "Technique IDs (TXXXX) are not supported; use generate_technique_layer.",
         )
 
-        layer_obj = generator.generate_layer(match=attack_id)
+    try:
+        attack_data = get_attack_data(domain)
+    except Exception as e:
+        return _layer_failure(raw_id, domain, f"Domain '{domain}' is not available: {e}")
 
-        # Basic sanity checks
-        if not layer_obj or not layer_obj.layer or not layer_obj.layer.techniques:
-            return {
-                "success": False,
-                "attack_id": attack_id,
-                "domain": domain,
-                "count": 0,
-                "layer": None,
-                "message": (
-                    f"No techniques found for '{attack_id}' in domain '{domain}'."
-                ),
-            }
+    try:
+        if attack_id.startswith("DC"):
+            kind, obj = "data component", attack_data.get_object_by_attack_id(
+                attack_id, "x-mitre-data-component"
+            )
+        elif attack_id[0] == "G":
+            kind, obj = "group", attack_data.get_object_by_attack_id(attack_id, "intrusion-set")
+        elif attack_id[0] == "M":
+            kind, obj = "mitigation", attack_data.get_object_by_attack_id(
+                attack_id, "course-of-action"
+            )
+        else:
+            kind = "software"
+            obj = attack_data.get_object_by_attack_id(attack_id, "malware")
+            if obj is None:
+                obj = attack_data.get_object_by_attack_id(attack_id, "tool")
 
-        # Keep only techniques with score > 0, then override score
-        layer_obj.layer.techniques = [
-            t for t in layer_obj.layer.techniques if getattr(t, "score", 0) > 0
+        if obj is None:
+            return _layer_failure(
+                raw_id, domain, f"'{attack_id}' not found in domain '{domain}'."
+            )
+
+        obj_stix = _field(obj, "id")
+        obj_name = _field(obj, "name")
+
+        # Collect (technique, provenance comment) pairs.
+        found: List[Tuple[Any, Optional[str]]] = []
+        if kind == "data component":
+            for tech, _dets, _ans in attack_data.techniques_for_datacomponent(obj_stix):
+                found.append((tech, None))
+        else:
+            if kind == "group":
+                entries = attack_data.get_techniques_used_by_group(obj_stix) or []
+            elif kind == "mitigation":
+                entries = attack_data.get_techniques_mitigated_by_mitigation(obj_stix) or []
+            else:
+                entries = attack_data.get_techniques_used_by_software(obj_stix) or []
+            for entry in entries:
+                prov_comment = None
+                if kind == "group":
+                    prov = _group_technique_provenance(attack_data, obj_stix, entry)
+                    if not prov["direct"]:
+                        if not include_campaigns:
+                            continue
+                        if prov["via_campaigns"]:
+                            prov_comment = "via campaign " + ", ".join(prov["via_campaigns"])
+                found.append((_unwrap(entry), prov_comment))
+
+        layer_entries: Dict[str, Dict[str, Any]] = {}
+        for tech, prov_comment in found:
+            if tech is None:
+                continue
+            if _field(tech, "revoked", False) or _field(tech, "x_mitre_deprecated", False):
+                continue
+            tid = _safe_attack_id(attack_data, _field(tech, "id"))
+            if not tid or tid in layer_entries:
+                continue
+            entry_out: Dict[str, Any] = {"techniqueID": tid, "score": score}
+            parts = []
+            if include_comments and _field(tech, "description"):
+                parts.append(str(_field(tech, "description")))
+            if prov_comment:
+                parts.append(prov_comment)
+            if parts:
+                entry_out["comment"] = "\n\n".join(parts) if include_comments else parts[0]
+            layer_entries[tid] = entry_out
+
+        if not layer_entries:
+            return _layer_failure(
+                raw_id, domain, f"No techniques found for '{attack_id}' in domain '{domain}'."
+            )
+
+        domain_label = {"enterprise": "Enterprise", "mobile": "Mobile", "ics": "ICS"}[domain]
+        layer = _build_navigator_layer(
+            domain,
+            f"{obj_name} ({obj_stix})",
+            f"{domain_label} techniques used by {obj_name}, ATT&CK {kind} {attack_id}",
+            list(layer_entries.values()),
+        )
+        count = len(layer_entries)
+        auto_added = [
+            t["techniqueID"] for t in layer["techniques"] if t["techniqueID"] not in layer_entries
         ]
-        for t in layer_obj.layer.techniques:
-            t.score = score
 
-        layer_dict = layer_obj.to_dict()
-        count = len(layer_obj.layer.techniques)
+        layer_path: Optional[str] = None
+        if save_to_file:
+            path, err = _save_layer(layer, f"{attack_id}-{obj_name}")
+            if path is None:
+                return _layer_failure(raw_id, domain, err or "Could not save layer.")
+            layer_path = str(path)
 
+        message = (
+            f"Generated Navigator layer for '{attack_id}' in domain "
+            f"'{domain}' with {count} technique(s)."
+        )
+        if layer_path:
+            message += f" Saved to {layer_path}."
         return {
             "success": True,
             "attack_id": attack_id,
             "domain": domain,
             "count": count,
-            "layer": layer_dict,
-            "message": (
-                f"Generated Navigator layer for '{attack_id}' in domain "
-                f"'{domain}' with {count} technique(s)."
-            ),
+            "layer": None if save_to_file else layer,
+            "layer_path": layer_path,
+            "auto_added_parents": auto_added,
+            "message": message,
+        }
+    except Exception as e:
+        return _layer_failure(raw_id, domain, f"Failed to generate layer: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Navigator layer helpers (pure dict builders, no navlayers objects: navlayers prints to stdout,
+# which is the MCP stream)
+# ---------------------------------------------------------------------------
+
+_LAYER_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+_SUBTECHNIQUE_RE = re.compile(r"^(.+)\.\d{3}$")
+_MAX_LAYER_ITEMS = 2000
+
+
+def _valid_score(v: Any) -> bool:
+    """True for finite real numbers; booleans and NaN/inf are rejected."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+_MAX_LAYER_COMMENT = 2000
+
+
+def _attack_major_version() -> str:
+    """Major part of the bundled ATT&CK release (e.g. '20' for '20.0')."""
+    return str(release_info.LATEST_VERSION).split(".")[0]
+
+
+def _build_navigator_layer(
+    domain: str,
+    name: str,
+    description: str,
+    entries: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build a Navigator layer dict.
+
+    entries: dicts with `techniqueID` and optional `score`, `color`, `comment`. No `tactic` is
+    emitted, so the annotation applies under every tactic of the technique (layer spec).
+    A listed parent with a listed sub-technique gets showSubtechniques; a sub-technique whose
+    parent is not listed gets an auto-added bare parent entry (appended after the entries).
+    """
+    if domain == "atlas":
+        nav_domain = "atlas-atlas"
+        versions: Dict[str, str] = {"layer": "4.3", "navigator": "4.6.4"}
+    else:
+        nav_domain = f"{domain}-attack"
+        versions = {
+            "attack": _attack_major_version(),
+            "navigator": "5.1.0",
+            "layer": "4.5",
         }
 
-    except Exception as e:
-        return {
-            "success": False,
-            "attack_id": attack_id,
-            "domain": domain,
-            "count": 0,
-            "layer": None,
-            "message": f"Failed to generate layer: {e}",
+    techniques: List[Dict[str, Any]] = [dict(e) for e in entries]
+    by_id = {t["techniqueID"]: t for t in techniques}
+    parents_with_subs = set()
+    for t in list(techniques):
+        m = _SUBTECHNIQUE_RE.match(t["techniqueID"])
+        if m:
+            parents_with_subs.add(m.group(1))
+    for parent in sorted(parents_with_subs):
+        if parent in by_id:
+            by_id[parent]["showSubtechniques"] = True
+        else:
+            techniques.append({"techniqueID": parent, "showSubtechniques": True})
+
+    layer: Dict[str, Any] = {
+        "name": name,
+        "versions": versions,
+        "domain": nav_domain,
+        "description": description,
+        "sorting": 0,
+        "layout": {
+            "layout": "side",
+            "aggregateFunction": "average",
+            "expandedSubtechniques": "none",
+        },
+        "hideDisabled": False,
+        "techniques": techniques,
+        "legendItems": [],
+        "metadata": [],
+        "links": [],
+        "tacticRowBackground": "#dddddd",
+    }
+
+    scores = [t["score"] for t in techniques if "score" in t]
+    if scores:
+        min_value = min(0, math.floor(min(scores)))
+        max_value = max(math.ceil(max(scores)), min_value + 2)
+        layer["gradient"] = {
+            "colors": ["#ff6666ff", "#ffe766ff", "#8ec843ff"],
+            "minValue": min_value,
+            "maxValue": max_value,
         }
+    return layer
+
+
+def _save_layer(layer: Dict[str, Any], name: str) -> Tuple[Optional[Path], Optional[str]]:
+    """Write a layer into LAYER_DIR and return (path, error).
+
+    The filename is derived from a sanitised slug of `name` plus a UTC timestamp; existing
+    files are never overwritten.
+    """
+    layer_dir = LAYER_DIR
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name or "").strip(".-")[:80] or "layer"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    try:
+        layer_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        layer_dir = layer_dir.resolve()
+        for attempt in range(1000):
+            suffix = f"-{attempt}" if attempt else ""
+            path = layer_dir / f"{slug}-{stamp}{suffix}.json"
+            if path.resolve().parent != layer_dir:
+                return None, "Refusing to write outside the layer directory."
+            try:
+                fh = open(path, "x", encoding="utf-8", opener=lambda p, f: os.open(p, f, 0o600))
+            except FileExistsError:
+                continue
+            with fh:
+                json.dump(layer, fh, indent=2)
+            return path, None
+        return None, "Could not find a free layer filename."
+    except OSError as e:
+        return None, f"Could not write layer file: {e}"
+
+
+def _layer_error(domain: str, message: str, **extra: Any) -> Dict[str, Any]:
+    """Uniform failure response for generate_technique_layer."""
+    res: Dict[str, Any] = {
+        "success": False,
+        "domain": domain,
+        "count": 0,
+        "technique_ids": [],
+        "auto_added_parents": [],
+        "unknown_ids": [],
+        "skipped": [],
+        "warnings": [],
+        "layer": None,
+        "layer_path": None,
+        "message": message,
+    }
+    res.update(extra)
+    return res
+
+
+@mcp.tool()
+async def generate_technique_layer(
+    techniques: List[Union[str, Dict[str, Any]]],
+    domain: str = "enterprise",
+    name: str = "Custom layer",
+    description: str = "",
+    default_score: Optional[float] = 1,
+    save_to_file: bool = False,
+) -> Dict[str, Any]:
+    """
+    Build an ATT&CK Navigator layer from an explicit list of techniques.
+
+    Args:
+        techniques: 1-2000 items. Each item is a technique ID string (e.g. "T1059",
+            "T1003.001"; case-insensitive) or an object with `technique_id` (alias
+            `techniqueID`) and optional `score` (number, not boolean), `color`
+            ("#RRGGBB") and `comment` (text, up to 2000 chars).
+        domain: "enterprise", "mobile", "ics" or "atlas". ATLAS layers use the "atlas-atlas"
+            Navigator domain (layer format 4.3) and IDs like "AML.T0051".
+        name: Layer name.
+        description: Layer description.
+        default_score: Score for items without their own score; null for no scores.
+        save_to_file: If True, write the layer JSON under the server's layer directory
+            (MITRE_MCP_LAYER_DIR) and return `layer_path` instead of the layer.
+
+    Returns:
+        {
+          "success": bool, "domain": str,
+          "count": <selected techniques, auto-added parents excluded>,
+          "technique_ids": [...], "auto_added_parents": [...],
+          "unknown_ids": [...], "skipped": [...revoked/deprecated...], "warnings": [...],
+          "layer": {...} | null, "layer_path": "<abs path>" | null, "message": str
+        }
+    """
+    domain = (domain or "").strip().lower()
+    if domain not in ("enterprise", "mobile", "ics", "atlas"):
+        return _layer_error(
+            domain, "Invalid domain. Must be one of: enterprise, mobile, ics, atlas."
+        )
+
+    if not isinstance(techniques, list) or not (1 <= len(techniques) <= _MAX_LAYER_ITEMS):
+        return _layer_error(
+            domain, f"`techniques` must be a list of 1 to {_MAX_LAYER_ITEMS} items."
+        )
+
+    if default_score is not None and not _valid_score(default_score):
+        return _layer_error(domain, "`default_score` must be a finite number or null.")
+
+    # --- Validate and normalise items ---
+    parsed: List[Tuple[str, Dict[str, Any]]] = []
+    for idx, item in enumerate(techniques):
+        opts: Dict[str, Any] = {}
+        if isinstance(item, str):
+            raw_id: Any = item
+        elif isinstance(item, dict):
+            unknown_keys = set(item) - {"technique_id", "techniqueID", "score", "color", "comment"}
+            if unknown_keys:
+                return _layer_error(
+                    domain, f"Item {idx}: unsupported key(s): {sorted(unknown_keys)}."
+                )
+            raw_id = item.get("technique_id", item.get("techniqueID"))
+            if "score" in item and item["score"] is not None:
+                if not _valid_score(item["score"]):
+                    return _layer_error(domain, f"Item {idx}: `score` must be a number.")
+                opts["score"] = item["score"]
+            if "color" in item and item["color"] is not None:
+                if not isinstance(item["color"], str) or not _LAYER_COLOR_RE.match(item["color"]):
+                    return _layer_error(domain, f"Item {idx}: `color` must look like #RRGGBB.")
+                opts["color"] = item["color"]
+            if "comment" in item and item["comment"] is not None:
+                if not isinstance(item["comment"], str) or len(item["comment"]) > _MAX_LAYER_COMMENT:
+                    return _layer_error(
+                        domain,
+                        f"Item {idx}: `comment` must be text up to {_MAX_LAYER_COMMENT} characters.",
+                    )
+                opts["comment"] = item["comment"]
+        else:
+            return _layer_error(domain, f"Item {idx}: must be a string or an object.")
+
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            return _layer_error(domain, f"Item {idx}: missing technique ID.")
+        parsed.append((raw_id.strip().upper(), opts))
+
+    try:
+        attack_data = get_attack_data(domain)
+    except Exception as e:
+        return _layer_error(domain, f"Domain '{domain}' is not available: {e}")
+
+    # --- Resolve against the loaded domain ---
+    selected: Dict[str, Dict[str, Any]] = {}
+    unknown_ids: List[str] = []
+    skipped: List[str] = []
+    warnings: List[str] = []
+    for tid, opts in parsed:
+        try:
+            obj = attack_data.get_object_by_attack_id(tid, "attack-pattern")
+        except Exception:
+            obj = None
+        if obj is None:
+            if tid not in unknown_ids:
+                unknown_ids.append(tid)
+            continue
+        if _field(obj, "revoked", False) or _field(obj, "x_mitre_deprecated", False):
+            if tid not in skipped:
+                skipped.append(tid)
+            continue
+        entry: Dict[str, Any] = {"techniqueID": tid}
+        score = opts.get("score", default_score)
+        if score is not None:
+            entry["score"] = score
+        if "color" in opts:
+            entry["color"] = opts["color"]
+        if "comment" in opts:
+            entry["comment"] = opts["comment"]
+        if tid in selected:
+            warnings.append(f"Duplicate technique ID {tid}: the last occurrence wins.")
+        selected[tid] = entry
+
+    if not selected:
+        return _layer_error(
+            domain,
+            "No valid techniques to put in the layer.",
+            unknown_ids=unknown_ids,
+            skipped=skipped,
+            warnings=warnings,
+        )
+
+    layer = _build_navigator_layer(domain, name, description, list(selected.values()))
+    technique_ids = list(selected)
+    auto_added = [t["techniqueID"] for t in layer["techniques"] if t["techniqueID"] not in selected]
+
+    layer_path: Optional[str] = None
+    if save_to_file:
+        path, err = _save_layer(layer, name)
+        if path is None:
+            return _layer_error(
+                domain,
+                err or "Could not save layer.",
+                unknown_ids=unknown_ids,
+                skipped=skipped,
+                warnings=warnings,
+            )
+        layer_path = str(path)
+
+    message = f"Layer with {len(technique_ids)} technique(s) for domain '{domain}'."
+    if layer_path:
+        message += f" Saved to {layer_path}."
+    if unknown_ids:
+        message += f" Unknown IDs: {', '.join(unknown_ids)}."
+    return {
+        "success": True,
+        "domain": domain,
+        "count": len(technique_ids),
+        "technique_ids": technique_ids,
+        "auto_added_parents": auto_added,
+        "unknown_ids": unknown_ids,
+        "skipped": skipped,
+        "warnings": warnings,
+        "layer": None if save_to_file else layer,
+        "layer_path": layer_path,
+        "message": message,
+    }
+
 
 @mcp.tool()
 async def get_layer_metadata(domain: str = "enterprise") -> Dict[str, Any]:
@@ -8575,8 +9376,8 @@ async def get_layer_metadata(domain: str = "enterprise") -> Dict[str, Any]:
     without starting from scratch.
 
     Args:
-        domain: One of "enterprise", "mobile", "ics". Defaults to "enterprise".
-            "atlas" is rejected: layers are not supported for ATLAS.
+        domain: One of "enterprise", "mobile", "ics", "atlas". Defaults to "enterprise".
+            "atlas" returns the ATLAS Navigator template (domain "atlas-atlas").
 
     Returns:
         {
@@ -8589,7 +9390,7 @@ async def get_layer_metadata(domain: str = "enterprise") -> Dict[str, Any]:
     # Base Navigator layer template
     base_metadata = {
         "name": "layer",
-        "versions": {"attack": "16", "navigator": "5.1.0", "layer": "4.5"},
+        "versions": {"attack": _attack_major_version(), "navigator": "5.1.0", "layer": "4.5"},
         "description": "",
         "sorting": 0,
         "layout": {
@@ -8608,6 +9409,24 @@ async def get_layer_metadata(domain: str = "enterprise") -> Dict[str, Any]:
         "links": [],
         "tacticRowBackground": "#dddddd",
     }
+
+    # Normalize domain
+    domain = domain.lower()
+    if domain == "atlas":
+        # Mirrors MITRE's published ATLAS Navigator layers (no ATT&CK version, no platforms).
+        atlas_metadata = dict(base_metadata)
+        atlas_metadata.update(
+            {
+                "domain": "atlas-atlas",
+                "versions": {"layer": "4.3", "navigator": "4.6.4"},
+            }
+        )
+        return {
+            "success": True,
+            "domain": domain,
+            "metadata": atlas_metadata,
+            "message": "Returned Navigator layer metadata for atlas domain.",
+        }
 
     # Domain → platform filter mappings
     domain_configs = {
@@ -8631,24 +9450,13 @@ async def get_layer_metadata(domain: str = "enterprise") -> Dict[str, Any]:
         },
     }
 
-    # Normalize domain
-    domain = domain.lower()
-    if domain == "atlas":
-        return {
-            "success": False,
-            "domain": domain,
-            "metadata": None,
-            "message": (
-                "ATLAS layers not supported: use ATLAS Navigator instead."
-            ),
-        }
     if domain not in domain_configs:
         return {
             "success": False,
             "domain": domain,
             "metadata": None,
             "message": (
-                "Invalid domain. Must be one of: enterprise, mobile, ics."
+                "Invalid domain. Must be one of: enterprise, mobile, ics, atlas."
             ),
         }
 

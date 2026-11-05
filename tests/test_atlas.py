@@ -115,12 +115,22 @@ async def test_get_all_groups_atlas_empty():
 
 async def test_generate_layer_atlas_guard():
     res = await server.generate_layer("AML.M0000", domain="atlas")
-    assert "ATLAS layers not supported" in str(res)
+    assert res["success"] is False
+    assert "generate_technique_layer" in res["message"]
     assert "Invalid ATT&CK ID format" not in str(res)
 
 
-async def test_get_layer_metadata_atlas_rejected():
+async def test_get_layer_metadata_atlas_template():
     res = await server.get_layer_metadata("atlas")
-    assert res["success"] is False
-    assert "ATLAS layers not supported" in res["message"]
-    assert "Must be one of" not in res["message"]
+    assert res["success"] is True
+    meta = res["metadata"]
+    assert meta["domain"] == "atlas-atlas"
+    assert meta["versions"] == {"layer": "4.3", "navigator": "4.6.4"}
+    assert "filters" not in meta
+
+
+@needs_atlas
+async def test_get_all_techniques_atlas_paging():
+    res = await server.get_all_techniques(domain="atlas", limit=3)
+    assert res["returned"] == 3
+    assert res["count"] > 3 and res["has_more"] is True
