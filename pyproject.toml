@@ -37,17 +37,37 @@ packages = ["src/mitre_mcp_server"]
 dev = [
     "pytest>=9.2.0",
     "pytest-asyncio>=1.4.1",
+    "pytest-cov>=7.1",
+    "coverage>=7.17",
+    "ruff>=0.17.3,<0.18",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+    "unit: no STIX data needed",
+    "data: needs the STIX cache (added automatically to tests without unit/protocol)",
+    "protocol: spawns the server over stdio",
+]
 
-[tool.black]
-line-length = 100
-target-version = ['py312']
+[tool.coverage.run]
+branch = true
+source = ["src/mitre_mcp_server"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 100
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mitre_mcp_server"]

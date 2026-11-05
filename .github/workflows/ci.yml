@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      MITRE_MCP_REQUIRE_ATLAS: "1"
+      MITRE_MCP_REQUIRE_DATA: "1"
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Resolve data versions
+        id: versions
+        run: |
+          uv run python - >> "$GITHUB_OUTPUT" <<'PY'
+          from mitreattack import release_info
+
+          from mitre_mcp_server import server
+
+          print(f"attack={release_info.LATEST_VERSION}")
+          print(f"atlas={server.ATLAS_VERSION}")
+          PY
+
+      - name: Restore STIX data cache
+        id: data-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.mitre-mcp-server/data
+          key: mitre-data-attack-${{ steps.versions.outputs.attack }}-atlas-${{ steps.versions.outputs.atlas }}
+
+      - name: Download STIX data
+        if: steps.data-cache.outputs.cache-hit != 'true'
+        run: |
+          uv run python - <<'PY'
+          import sys
+
+          from mitre_mcp_server import server
+
+          server.download_all_domains()
+          missing = set(server.DOMAINS) - set(server.check_existing_data())
+          if missing:
+              sys.exit(f"download incomplete, missing: {sorted(missing)}")
+          PY
+
+      - name: Verify STIX bundle hashes
+        run: |
+          uv run python - <<'PY'
+          import hashlib
+          import sys
+
+          from mitreattack import release_info
+
+          from mitre_mcp_server import server
+
+          problems = []
+          for domain in server.DOMAINS:
+              if domain == "atlas":
+                  expected = server.ATLAS_SHA256
+              else:
+                  expected = release_info.STIX21[domain][release_info.LATEST_VERSION]
+              path = server.get_stix_path(domain)
+              if not path.is_file():
+                  problems.append(f"{domain}: bundle file missing at {path}")
+                  continue
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if digest != expected:
+                  problems.append(f"{domain}: hash mismatch (expected {expected}, got {digest})")
+          if problems:
+              sys.exit("STIX bundle check failed:\n" + "\n".join(problems))
+          PY
+
+      - name: Lint
+        run: uv run ruff check src tests
+
+      - name: Unit tests run without STIX data
+        run: |
+          empty="$(mktemp -d)"
+          MITRE_MCP_DATA_DIR="$empty" uv run pytest -q -m unit
+
+      - name: Test with coverage gate
+        run: uv run pytest -q -rs --cov --cov-report=term-missing

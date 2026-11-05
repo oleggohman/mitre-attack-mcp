@@ -1,6 +1,7 @@
 """include_description=False must leave no object description anywhere in the result."""
 
 import pytest
+
 from mitre_mcp_server import server
 
 

@@ -2,8 +2,8 @@
 
 import re
 
-import pytest
-from conftest import needs_atlas
+from conftest import needs_atlas, require_domain
+
 from mitre_mcp_server import server
 
 
@@ -115,8 +115,7 @@ async def test_techniques_mitigated_atlas(atlas_loaded):
 
 
 def _need_ics():
-    if not server.get_stix_path("ics").exists():
-        pytest.skip("ICS data not cached")
+    require_domain("ics")
 
 
 async def test_ics_asset_tools():

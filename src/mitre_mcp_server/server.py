@@ -89,7 +89,8 @@ def check_existing_data() -> List[str]:
 
 def _download_atlas(stix_path: Path) -> None:
     """Download the pinned ATLAS bundle, verify its SHA-256 and store it atomically."""
-    with urllib.request.urlopen(ATLAS_URL, timeout=60) as resp:  # noqa: S310 - fixed https URL
+    # ATLAS_URL is a fixed https URL, not user input.
+    with urllib.request.urlopen(ATLAS_URL, timeout=60) as resp:
         content = resp.read()
 
     digest = hashlib.sha256(content).hexdigest()
@@ -208,7 +209,8 @@ class _MitreData(MitreAttackData):
     ATT&CK behaviour is unchanged.
     """
 
-    _ID_SOURCES = ("mitre-attack", "mitre-atlas")
+    # Legacy mobile/ICS objects (revoked techniques) still carry the pre-merge source names.
+    _ID_SOURCES = ("mitre-attack", "mitre-mobile-attack", "mitre-ics-attack", "mitre-atlas")
 
     def get_objects_by_type(self, stix_type, remove_revoked_deprecated=False):
         try:
@@ -358,7 +360,9 @@ class _MitreData(MitreAttackData):
             chain.append({"detection_strategy": det, "analytics": analytics})
         return chain
 
-    def techniques_for_datacomponent(self, dc_stix_id: str) -> List[Tuple[Any, List[str], List[str]]]:
+    def techniques_for_datacomponent(
+        self, dc_stix_id: str
+    ) -> List[Tuple[Any, List[str], List[str]]]:
         """Return [(technique, [DET stix ids], [analytic stix ids])] detected via a data component.
 
         Revoked/deprecated techniques are dropped; results are deduplicated by technique id.
@@ -560,7 +564,11 @@ def _group_technique_provenance(
         elif src.startswith("campaign--") and src not in campaign_refs:
             campaign_refs.append(src)
     via = sorted(
-        {aid if aid else ref for ref in campaign_refs for aid in [_safe_attack_id(attack_data, ref)]}
+        {
+            aid if aid else ref
+            for ref in campaign_refs
+            for aid in [_safe_attack_id(attack_data, ref)]
+        }
     )
     return {"direct": direct, "via_campaigns": via}
 
@@ -715,8 +723,8 @@ async def get_data_stats() -> Dict[str, Any]:
     Return statistics about downloaded MITRE ATT&CK and ATLAS STIX data.
 
     This confirms which domains are present on disk, their file paths,
-    sizes, and release version (ATT&CK release; pinned ATLAS release for "atlas"). It assumes that downloads have
-    already been attempted at server startup.
+    sizes, and release version (ATT&CK release; pinned ATLAS release for "atlas"). It assumes that
+    downloads have already been attempted at server startup.
     """
     return _compute_data_stats()
 
@@ -727,7 +735,7 @@ async def get_technique_by_id(
     include_description: bool = True,
     ) -> Dict[str, Any]:
 
-    """" 
+    """"
     Retrieve a MITRE ATT&CK technique by its external ATT&CK ID (e.g., "T1055", "T1053.005").
 
     This tool searches the specified ATT&CK domain (enterprise, mobile, ics, or atlas)
@@ -1430,6 +1438,64 @@ async def search_techniques(
         ),
     }
 
+AMBIGUOUS_MATCH_CAP = 10
+
+
+def _find_group(
+    attack_data: Any, groups: List[Any], query: str
+) -> Tuple[Any, List[str]]:
+    """Find a group by name or alias (case-insensitive).
+
+    An exact name match wins over an exact alias match, which wins over a partial match, so
+    "APT1" resolves to APT1 and not to the first group whose name merely contains it (APT17).
+    An empty or whitespace-only query matches nothing.
+
+    Returns (group, ambiguous_ids). `group` is None when nothing matches. When only partial
+    matching finds more than one group, the group with the lowest ATT&CK ID is returned and
+    `ambiguous_ids` lists the ATT&CK IDs of all partial matches (sorted, capped); otherwise it
+    is empty.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return None, []
+
+    def names(grp):
+        if isinstance(grp, dict):
+            name, aliases = grp.get("name"), grp.get("aliases")
+        else:
+            name, aliases = getattr(grp, "name", None), getattr(grp, "aliases", None)
+        return (name or "").lower(), [a.lower() for a in (aliases or [])]
+
+    pairs = [(grp, *names(grp)) for grp in groups]
+    for grp, name, _ in pairs:
+        if q == name:
+            return grp, []
+    for grp, _, aliases in pairs:
+        if q in aliases:
+            return grp, []
+    partial = [
+        grp for grp, name, aliases in pairs if q in name or any(q in alias for alias in aliases)
+    ]
+    if not partial:
+        return None, []
+    if len(partial) == 1:
+        return partial[0], []
+    keyed = sorted(
+        ((_safe_attack_id(attack_data, _field(grp, "id")), grp) for grp in partial),
+        key=lambda pair: (pair[0] is None, pair[0] or ""),
+    )
+    ids = [aid for aid, _ in keyed if aid]
+    return keyed[0][1], ids[:AMBIGUOUS_MATCH_CAP]
+
+
+def _ambiguity_note(ambiguous_ids: List[str], returned_id: Optional[str]) -> str:
+    """Message suffix telling the caller that a partial query matched several groups."""
+    return (
+        f" The query matched several groups; returning the first by ATT&CK ID ({returned_id}). "
+        f"See ambiguous_matches for the candidates."
+    )
+
+
 @mcp.tool()
 async def get_group_by_name(
     group_name: str,
@@ -1440,7 +1506,9 @@ async def get_group_by_name(
     Retrieve an intrusion set (APT group) by name or alias (case-insensitive match).
 
     This tool searches ATT&CK intrusion sets by name or alias and returns the first
-    matching group. Matching is case-insensitive and supports partial matches.
+    matching group. Matching is case-insensitive and supports partial matches. An empty
+    query matches nothing. When a partial query matches several groups, the one with the
+    lowest ATT&CK ID is returned and `ambiguous_matches` lists the candidates' ATT&CK IDs.
 
     Examples:
         - get_group_by_name("APT29")
@@ -1462,6 +1530,8 @@ async def get_group_by_name(
               "stix_id": "<intrusion-set--...>",
               "description": "<description or null>"
           },
+          "ambiguous_matches": ["GXXXX", ...],   (only when a partial query matched
+                                                  several groups; at most 10)
           "formatted": "<human-readable text>",
           "message": "<status>"
         }
@@ -1473,22 +1543,7 @@ async def get_group_by_name(
     except Exception:
         groups = []
 
-    query = group_name.lower()
-    match = None
-
-    # Search loop
-    for grp in groups:
-        # dict-like vs attribute-like STIX objects
-        if isinstance(grp, dict):
-            name = grp.get("name", "").lower()
-            aliases = [a.lower() for a in grp.get("aliases", [])]
-        else:
-            name = getattr(grp, "name", "").lower()
-            aliases = [a.lower() for a in getattr(grp, "aliases", [])]
-
-        if query in name or any(query in alias for alias in aliases):
-            match = grp
-            break
+    match, ambiguous = _find_group(attack_data, groups, group_name)
 
     if match is None:
         return {
@@ -1520,6 +1575,12 @@ async def get_group_by_name(
     except Exception:
         pass
 
+    message = f"Found intrusion set matching '{group_name}' in domain '{domain}'."
+    extra: Dict[str, Any] = {}
+    if ambiguous:
+        message += _ambiguity_note(ambiguous, attack_id)
+        extra["ambiguous_matches"] = ambiguous
+
     return {
         "found": True,
         "group": {
@@ -1529,7 +1590,8 @@ async def get_group_by_name(
             "stix_id": stix_id,
             "description": description,
         },
-        "message": f"Found intrusion set matching '{group_name}' in domain '{domain}'.",
+        **extra,
+        "message": message,
     }
 
 @mcp.tool()
@@ -1715,7 +1777,9 @@ async def get_group_techniques(
     Get all techniques used by a specific APT group (intrusion set).
 
     This tool:
-      1) Locates a group by name or alias (case-insensitive, partial match).
+      1) Locates a group by name or alias (case-insensitive, partial match). An empty name
+         matches nothing; when a partial name matches several groups the lowest ATT&CK ID is
+         used and `ambiguous_matches` lists the candidates' ATT&CK IDs.
       2) Uses MITRE's get_techniques_used_by_group() to retrieve techniques
          related to that group (via 'uses' relationships).
 
@@ -1776,20 +1840,7 @@ async def get_group_techniques(
     except Exception:
         groups = []
 
-    query = group_name.lower()
-    group = None
-
-    for grp in groups:
-        if isinstance(grp, dict):
-            name = (grp.get("name") or "").lower()
-            aliases = [a.lower() for a in grp.get("aliases", [])]
-        else:
-            name = (getattr(grp, "name", "") or "").lower()
-            aliases = [a.lower() for a in getattr(grp, "aliases", [])]
-
-        if query in name or any(query in alias for alias in aliases):
-            group = grp
-            break
+    group, ambiguous = _find_group(attack_data, groups, group_name)
 
     if group is None:
         return {
@@ -1871,7 +1922,9 @@ async def get_group_techniques(
         except Exception:
             t_attack_id = None
 
-        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
+        relationships_info = (
+            _relationships_info(rels, include_description) if include_relationships else []
+        )
 
         techniques_structured.append(
             {
@@ -1919,11 +1972,13 @@ async def get_group_techniques(
         "campaign_only_count": len(campaign_only),
         "techniques": page,
         **page_meta,
+        **({"ambiguous_matches": ambiguous} if ambiguous else {}),
         "formatted": formatted,
         "message": (
             f"Found {len(techniques_structured)} technique(s) used by group "
             f"'{group_name}' in domain '{domain}': "
             f"{_provenance_message(direct_count, campaign_only)}."
+            f"{_ambiguity_note(ambiguous, group_attack_id) if ambiguous else ''}"
         ),
     }
 
@@ -1944,7 +1999,8 @@ async def get_software(
         domain: ATT&CK domain to search ("enterprise", "mobile", "ics", or "atlas").
         include_description: Whether to include descriptions in the output and
                              formatted text.
-        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID;
+            `count` is the total number of matches.
         offset: Number of items to skip (for paging with `limit`).
 
     Returns:
@@ -2389,34 +2445,49 @@ async def get_stats(
 
     Returns:
         {
+          "success": bool,  # False when a count could not be computed
           "domain": "<domain>",
           "stats": {
-              "techniques": <int>,
-              "groups": <int>,
-              "software": <int>,
-              "tactics": <int>,
-              "mitigations": <int>
-          },
+              "techniques": <int | null>,
+              "groups": <int | null>,
+              "software": <int | null>,
+              "tactics": <int | null>,
+              "mitigations": <int | null>
+          },  # a count is null when its lookup failed
           "message": "<status message>"
         }
     """
     attack_data = get_attack_data(domain)
 
-    def safe_count(getter) -> int:
+    errors: Dict[str, str] = {}
+
+    def count(key: str, getter) -> Optional[int]:
         try:
             return len(getter(remove_revoked_deprecated=True))
-        except Exception:
-            return 0
+        except Exception as e:
+            errors[key] = str(e) or type(e).__name__
+            return None
 
     stats = {
-        "techniques": safe_count(attack_data.get_techniques),
-        "groups": safe_count(attack_data.get_groups),
-        "software": safe_count(attack_data.get_software),
-        "tactics": safe_count(attack_data.get_tactics),
-        "mitigations": safe_count(attack_data.get_mitigations),
+        "techniques": count("techniques", attack_data.get_techniques),
+        "groups": count("groups", attack_data.get_groups),
+        "software": count("software", attack_data.get_software),
+        "tactics": count("tactics", attack_data.get_tactics),
+        "mitigations": count("mitigations", attack_data.get_mitigations),
     }
 
+    if errors:
+        # Do not report zero counts as if the domain were empty.
+        details = "; ".join(f"{k}: {v}" for k, v in errors.items())
+        return {
+            "success": False,
+            "domain": domain,
+            "stats": stats,
+            "message": f"Failed to compute statistics for domain '{domain}': {details}",
+        }
+
     return {
+        "success": True,
         "domain": domain,
         "stats": stats,
         "message": (
@@ -2444,7 +2515,7 @@ async def get_groups_by_alias(
 
     Many groups have multiple aliases—e.g., APT29 is also known as:
     "Cozy Bear", "NOBELIUM", "Midnight Blizzard", etc.
-    
+
     This tool returns all groups whose alias list contains the given alias
     (case-insensitive exact match, per MITRE's own alias indexing).
 
@@ -2687,7 +2758,9 @@ async def get_techniques_used_by_group(
         except Exception:
             t_attack_id = None
 
-        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
+        relationships_info = (
+            _relationships_info(rels, include_description) if include_relationships else []
+        )
 
         techniques_structured.append(
             {
@@ -2870,7 +2943,9 @@ async def get_software_used_by_group(
         except Exception:
             s_attack_id = None
 
-        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
+        relationships_info = (
+            _relationships_info(rels, include_description) if include_relationships else []
+        )
 
         software_structured.append(
             {
@@ -3143,6 +3218,7 @@ async def get_techniques_used_by_group_software(
     group_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = False,
+    include_campaigns: bool = True,
     limit: Optional[int] = None,
     offset: int = 0,
 ) -> Dict[str, Any]:
@@ -3156,6 +3232,9 @@ async def get_techniques_used_by_group_software(
         group_stix_id: STIX ID of the group (e.g., "intrusion-set--UUID").
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         include_description: Whether to include technique descriptions.
+        include_campaigns: If True (default), also follow software used by campaigns attributed
+            to the group (same software set as get_software_used_by_group); if False, only
+            software the group uses directly.
         limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID.
         offset: Number of items to skip (for paging with `limit`).
 
@@ -3179,6 +3258,8 @@ async def get_techniques_used_by_group_software(
             },
             ...
           ],
+
+          "warnings": ["<software skipped because its technique lookup failed>", ...],
 
           "formatted": "<human-readable list of techniques>",
           "message": "<status summary>"
@@ -3216,8 +3297,26 @@ async def get_techniques_used_by_group_software(
         }
 
     # Call MITRE helper: techniques reachable via group’s software
+    warnings: List[str] = []
     try:
-        rel_entries = attack_data.get_techniques_used_by_group_software(group_stix_id)
+        if include_campaigns:
+            # The library helper only follows software the group uses directly, while
+            # get_software_used_by_group also lists software of attributed campaigns.
+            rel_entries = []
+            for sw_entry in attack_data.get_software_used_by_group(group_stix_id) or []:
+                sw_id = _field(_unwrap(sw_entry), "id")
+                if not sw_id:
+                    continue
+                try:
+                    rel_entries.extend(attack_data.get_techniques_used_by_software(sw_id) or [])
+                except Exception as exc:
+                    # One failing software must not hide the techniques of the others.
+                    warnings.append(
+                        f"Skipped software {sw_id}: technique lookup failed "
+                        f"({type(exc).__name__})."
+                    )
+        else:
+            rel_entries = attack_data.get_techniques_used_by_group_software(group_stix_id)
     except Exception:
         rel_entries = []
 
@@ -3227,6 +3326,7 @@ async def get_techniques_used_by_group_software(
             "group": group_info,
             "count": 0,
             "techniques": [],
+            "warnings": warnings,
             "formatted": "",
             "message": (
                 f"No techniques found via software used by group STIX ID "
@@ -3287,6 +3387,7 @@ async def get_techniques_used_by_group_software(
         "count": len(techniques_structured),
         "techniques": page,
         **page_meta,
+        "warnings": warnings,
         "formatted": formatted,
         "message": (
             f"Found {len(techniques_structured)} technique(s) reachable via software "
@@ -3435,7 +3536,9 @@ async def get_groups_using_technique(
         except Exception:
             g_attack_id = None
 
-        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
+        relationships_info = (
+            _relationships_info(rels, include_description) if include_relationships else []
+        )
 
         groups_structured.append(
             {
@@ -3610,7 +3713,9 @@ async def get_groups_using_software(
         except Exception:
             g_attack_id = None
 
-        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
+        relationships_info = (
+            _relationships_info(rels, include_description) if include_relationships else []
+        )
 
         groups_structured.append(
             {
@@ -3781,7 +3886,9 @@ async def get_groups_attributing_to_campaign(
         except Exception:
             g_attack_id = None
 
-        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
+        relationships_info = (
+            _relationships_info(rels, include_description) if include_relationships else []
+        )
 
         groups_structured.append(
             {
@@ -3913,14 +4020,12 @@ async def get_software_by_alias(
             }
         )
 
-    # Optional human-readable formatting
-    formatted = ""
-    if software_objects_for_format:
-        formatted = format_objects(
-            software_objects_for_format,
-            include_description=include_description,
-            domain=domain,
-        )
+    # Human-readable formatting (the list holds every software object appended above)
+    formatted = format_objects(
+        software_objects_for_format,
+        include_description=include_description,
+        domain=domain,
+    )
 
     return {
         "alias": alias,
@@ -4074,7 +4179,9 @@ async def get_software_using_technique(
         except Exception:
             s_attack_id = None
 
-        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
+        relationships_info = (
+            _relationships_info(rels, include_description) if include_relationships else []
+        )
 
         software_structured.append(
             {
@@ -4251,7 +4358,9 @@ async def get_techniques_used_by_software(
         except Exception:
             t_attack_id = None
 
-        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
+        relationships_info = (
+            _relationships_info(rels, include_description) if include_relationships else []
+        )
 
         techniques_structured.append(
             {
@@ -4310,7 +4419,8 @@ async def get_all_techniques(
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated techniques.
         include_description: Whether to include technique descriptions.
-        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID;
+            `count` is the total number of matches.
         offset: Number of items to skip (for paging with `limit`).
 
     Returns:
@@ -4399,19 +4509,17 @@ async def get_all_techniques(
             }
         )
 
-    # Formatted block (optional)
-    formatted = ""
-    if technique_objects_for_format:
-        total_found = len(structured)
+    # Formatted block (never empty here: every technique above is appended to both lists)
+    total_found = len(structured)
     structured, technique_objects_for_format, page_meta = _sort_and_page(
         structured, technique_objects_for_format, limit, offset
     )
 
     formatted = format_objects(
-            technique_objects_for_format,
-            include_description=include_description,
-            domain=domain,
-        )
+        technique_objects_for_format,
+        include_description=include_description,
+        domain=domain,
+    )
 
     return {
         "domain": domain,
@@ -4443,7 +4551,8 @@ async def get_all_subtechniques(
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated subtechniques.
         include_description: Whether to include descriptions.
-        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID;
+            `count` is the total number of matches.
         offset: Number of items to skip (for paging with `limit`).
 
     Returns:
@@ -4457,15 +4566,18 @@ async def get_all_subtechniques(
               "stix_id": "<attack-pattern--UUID>",
               "description": "<text or null>",
               "tactics": ["<Tactic 1>", "<Tactic 2>", ...],
-              "parent_attack_id": "<TXXXX>",
-              "parent_name": "<parent technique name>",
-              "parent_stix_id": "<attack-pattern--UUID>"
+              "parent_attack_id": "<TXXXX or null>",
+              "parent_name": "<parent technique name or null>",
+              "parent_stix_id": "<attack-pattern--UUID or null>"
             },
             ...
           ],
           "formatted": "<optional human-readable output>",
           "message": "<summary>"
         }
+
+    Parent fields are null for subtechniques without a parent relationship
+    (revoked subtechniques, listed only when remove_revoked_deprecated=False).
     """
     attack_data = get_attack_data(domain)
 
@@ -4510,8 +4622,14 @@ async def get_all_subtechniques(
         except Exception:
             parent_entries = []
 
-        if not parent_entries:
-            # Not a subtechnique
+        # A subtechnique has a parent relationship or carries the subtechnique flag
+        # (revoked ones lose their "subtechnique-of" relationship but keep the flag).
+        flag = (
+            t.get("x_mitre_is_subtechnique")
+            if isinstance(t, dict)
+            else getattr(t, "x_mitre_is_subtechnique", None)
+        )
+        if not parent_entries and flag is not True:
             continue
 
         # At this point, t is a subtechnique
@@ -4524,9 +4642,10 @@ async def get_all_subtechniques(
             sub_attack_id = None
 
         # Resolve parent fields
-        parent_obj = _unwrap(parent_entries[0])
-        parent_stix_id = _field(parent_obj, "id")
-        parent_name = _field(parent_obj, "name")
+        # No parent found (e.g. revoked subtechnique): parent fields stay None.
+        parent_obj = _unwrap(parent_entries[0]) if parent_entries else None
+        parent_stix_id = _field(parent_obj, "id") if parent_obj is not None else None
+        parent_name = _field(parent_obj, "name") if parent_obj is not None else None
 
         try:
             parent_attack_id = (
@@ -4614,7 +4733,8 @@ async def get_all_parent_techniques(
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated techniques.
         include_description: Whether to include descriptions.
-        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID;
+            `count` is the total number of matches.
         offset: Number of items to skip (for paging with `limit`).
 
     Returns:
@@ -4759,7 +4879,8 @@ async def get_all_groups(
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated groups.
         include_description: Whether to include descriptions.
-        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID;
+            `count` is the total number of matches.
         offset: Number of items to skip (for paging with `limit`).
 
     Returns:
@@ -4885,7 +5006,8 @@ async def get_all_software(
         domain: ATT&CK domain ("enterprise", "mobile", "ics", "atlas").
         remove_revoked_deprecated: Whether to exclude revoked/deprecated software.
         include_description: Whether to include descriptions.
-        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID;
+            `count` is the total number of matches.
         offset: Number of items to skip (for paging with `limit`).
 
     Returns:
@@ -5315,7 +5437,7 @@ async def get_all_campaigns(
     """
     Get all ATT&CK campaigns in a domain.
 
-    Campaigns represent specific intrusion events or long-running operations 
+    Campaigns represent specific intrusion events or long-running operations
     attributed to threat actors (e.g., SolarWinds, Operation Ghost).
 
     Args:
@@ -5672,7 +5794,7 @@ async def get_all_assets(
     """
     Get all ATT&CK assets in a domain (primarily ICS).
 
-    Assets represent industrial control system components 
+    Assets represent industrial control system components
     (PLC, HMI, Engineering Workstation, Control Server, etc.)
 
     Args:
@@ -5950,7 +6072,9 @@ async def get_techniques_targeting_asset(
             "count": 0,
             "techniques": [],
             "formatted": "",
-            "message": f"No techniques found targeting asset '{asset_stix_id}' in domain '{domain}'.",
+            "message": (
+                f"No techniques found targeting asset '{asset_stix_id}' in domain '{domain}'."
+            ),
         }
 
     # Build machine-readable list
@@ -6121,7 +6245,9 @@ async def get_campaigns_using_technique(
         except Exception:
             c_attack_id = None
 
-        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
+        relationships_info = (
+            _relationships_info(rels, include_description) if include_relationships else []
+        )
 
         campaigns_structured.append(
             {
@@ -6299,7 +6425,9 @@ async def get_techniques_used_by_campaign(
             if phase_name:
                 tactics.append(phase_name.replace("-", " ").title())
 
-        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
+        relationships_info = (
+            _relationships_info(rels, include_description) if include_relationships else []
+        )
 
         techniques_structured.append(
             {
@@ -6470,7 +6598,9 @@ async def get_campaigns_using_software(
         except Exception:
             c_attack_id = None
 
-        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
+        relationships_info = (
+            _relationships_info(rels, include_description) if include_relationships else []
+        )
 
         campaigns_structured.append(
             {
@@ -6640,7 +6770,9 @@ async def get_software_used_by_campaign(
         except Exception:
             s_attack_id = None
 
-        relationships_info = _relationships_info(rels, include_description) if include_relationships else []
+        relationships_info = (
+            _relationships_info(rels, include_description) if include_relationships else []
+        )
 
         software_structured.append(
             {
@@ -6696,7 +6828,8 @@ async def get_techniques_by_platform(
                   'Office Suite', 'Containers', 'ESXi', 'Network Devices'.
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas').
         include_description: Whether to include technique descriptions.
-        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID;
+            `count` is the total number of matches.
         offset: Number of items to skip (for paging with `limit`).
         remove_revoked_deprecated: Exclude revoked/deprecated techniques (default True).
 
@@ -6922,7 +7055,10 @@ async def get_subtechniques_of_technique(
     except Exception:
         parent_attack_id = None
 
-    parent_obj = attack_data.get_object_by_stix_id(technique_stix_id)
+    try:
+        parent_obj = attack_data.get_object_by_stix_id(technique_stix_id)
+    except Exception:
+        parent_obj = None
     parent_name = getattr(parent_obj, "name", None) if parent_obj else None
 
     # Retrieve subtechniques
@@ -6933,6 +7069,15 @@ async def get_subtechniques_of_technique(
         ]
     except Exception:
         subs = []
+
+    if parent_obj is None:
+        return {
+            "parent": {"stix_id": technique_stix_id, "attack_id": None, "name": None},
+            "count": 0,
+            "subtechniques": [],
+            "formatted": "",
+            "message": f"Technique STIX ID '{technique_stix_id}' not found in domain '{domain}'.",
+        }
 
     if not subs:
         return {
@@ -7035,7 +7180,10 @@ async def get_techniques_mitigated_by_mitigation(
     attack_data = get_attack_data(domain)
 
     # --- Resolve the mitigation object ---
-    mitigation_obj = attack_data.get_object_by_stix_id(mitigation_stix_id)
+    try:
+        mitigation_obj = attack_data.get_object_by_stix_id(mitigation_stix_id)
+    except Exception:
+        mitigation_obj = None
     if mitigation_obj is None:
         return {
             "found": False,
@@ -7205,8 +7353,7 @@ async def get_mitigations_mitigating_technique(
 
         # Dict-like wrapper
         if isinstance(entry, dict):
-            if isinstance(entry.get("object"), (dict, object)):
-                return entry.get("object")
+            return entry.get("object")
 
         # If it's already a mitigation (unexpected, but safe)
         return entry
@@ -7282,7 +7429,7 @@ def get_datacomponents_detecting_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = False,
-) -> dict:
+) -> Dict[str, Any]:
     """
     Get all data components that can detect a specific technique.
 
@@ -7398,7 +7545,9 @@ def get_datacomponents_detecting_technique(
                             {
                                 "stix_id": _get_attr(r, "id"),
                                 "relationship_type": _get_attr(r, "relationship_type"),
-                                "description": _get_attr(r, "description") if include_description else None,
+                                "description": (
+                                    _get_attr(r, "description") if include_description else None
+                                ),
                                 "source_ref": _get_attr(r, "source_ref"),
                                 "target_ref": _get_attr(r, "target_ref"),
                             }
@@ -7444,7 +7593,11 @@ def get_datacomponents_detecting_technique(
                 dc_obj = attack_data.get_object_by_stix_id(dc_ref)
             except Exception:
                 dc_obj = None
-            if dc_obj is None or _get_attr(dc_obj, "revoked") or _get_attr(dc_obj, "x_mitre_deprecated"):
+            if (
+                dc_obj is None
+                or _get_attr(dc_obj, "revoked")
+                or _get_attr(dc_obj, "x_mitre_deprecated")
+            ):
                 continue
             ds_ref = _get_attr(dc_obj, "x_mitre_data_source_ref")
             ds_name = None
@@ -7733,9 +7886,11 @@ async def get_techniques_detected_by_datacomponent(
             chain = []
         for tech, det_ids, an_ids in chain:
             techniques.append(tech)
+            det_aids = [_safe_attack_id(attack_data, d) for d in det_ids]
+            an_aids = [_safe_attack_id(attack_data, a) for a in an_ids]
             chain_links[_field(tech, "id")] = (
-                [_safe_attack_id(attack_data, d) for d in det_ids if _safe_attack_id(attack_data, d)],
-                [_safe_attack_id(attack_data, a) for a in an_ids if _safe_attack_id(attack_data, a)],
+                [x for x in det_aids if x],
+                [x for x in an_aids if x],
             )
 
     if not techniques:
@@ -7775,13 +7930,11 @@ async def get_techniques_detected_by_datacomponent(
         )
 
     # --- Optional human-readable formatted output. Can be silent if needed ---
-    formatted = ""
-    if techniques:
-        formatted = format_objects(
-            techniques,
-            include_description=include_description,
-            domain=domain,
-        )
+    formatted = format_objects(
+        techniques,
+        include_description=include_description,
+        domain=domain,
+    )
 
     return {
         "datacomponent": datacomponent_info,
@@ -7813,7 +7966,8 @@ async def get_detection_strategies_for_technique(
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas'). ATLAS has no
                 detection strategies and returns count 0.
         platform: Optional platform filter (case-insensitive), matched against the analytic
-                  platforms (e.g., "Windows", "IaaS"). Strategies left without analytics are dropped.
+                  platforms (e.g., "Windows", "IaaS"). Strategies left without analytics are
+                  dropped.
         include_description: Include technique/analytic descriptions and mutable elements.
 
     Returns:
@@ -7881,7 +8035,9 @@ async def get_detection_strategies_for_technique(
                 log_sources.append(
                     {
                         "data_component_attack_id": _safe_attack_id(attack_data, dc_ref),
-                        "data_component_name": _field(dc_obj, "name") if dc_obj is not None else None,
+                        "data_component_name": (
+                            _field(dc_obj, "name") if dc_obj is not None else None
+                        ),
                         "data_component_stix_id": dc_ref,
                         "name": _field(ref, "name"),
                         "channel": _field(ref, "channel"),
@@ -8299,7 +8455,8 @@ async def get_objects_by_type(
         domain: ATT&CK domain ('enterprise', 'mobile', 'ics', 'atlas', ...).
         remove_revoked_deprecated: Exclude revoked/deprecated objects.
         include_description: Include object descriptions in output.
-        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        limit: Maximum items to return (default: all). Items are sorted by ATT&CK ID;
+            `count` is the total number of matches.
         offset: Number of items to skip (for paging with `limit`).
 
     Returns:
@@ -8400,7 +8557,7 @@ async def get_tactics_by_matrix(
     matrix_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = False,
-):
+) -> Dict[str, Any]:
     """
     Get all ATT&CK tactics belonging to a specific matrix.
 
@@ -8480,7 +8637,7 @@ async def get_tactics_by_technique(
     technique_stix_id: str,
     domain: str = "enterprise",
     include_description: bool = False,
-):
+) -> Dict[str, Any]:
     """
     Get all tactics associated with a specific ATT&CK technique.
 
@@ -8576,7 +8733,8 @@ async def get_objects_created_after(
     Revoked/deprecated objects are excluded unless remove_revoked_deprecated=False.
 
     Args:
-        limit: Maximum items to return (default 100; null = no limit, 0 = count only). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        limit: Maximum items to return (default 100; null = no limit, 0 = count only). Items are
+            sorted by ATT&CK ID; `count` is the total number of matches.
         offset: Number of items to skip (for paging with `limit`).
 
     Returns:
@@ -8679,7 +8837,8 @@ async def get_objects_modified_after(
     Revoked/deprecated objects are excluded unless remove_revoked_deprecated=False.
 
     Args:
-        limit: Maximum items to return (default 100; null = no limit, 0 = count only). Items are sorted by ATT&CK ID; `count` is the total number of matches.
+        limit: Maximum items to return (default 100; null = no limit, 0 = count only). Items are
+            sorted by ATT&CK ID; `count` is the total number of matches.
         offset: Number of items to skip (for paging with `limit`).
 
     Returns:
@@ -9270,10 +9429,12 @@ async def generate_technique_layer(
                     return _layer_error(domain, f"Item {idx}: `color` must look like #RRGGBB.")
                 opts["color"] = item["color"]
             if "comment" in item and item["comment"] is not None:
-                if not isinstance(item["comment"], str) or len(item["comment"]) > _MAX_LAYER_COMMENT:
+                comment = item["comment"]
+                if not isinstance(comment, str) or len(comment) > _MAX_LAYER_COMMENT:
                     return _layer_error(
                         domain,
-                        f"Item {idx}: `comment` must be text up to {_MAX_LAYER_COMMENT} characters.",
+                        f"Item {idx}: `comment` must be text up to "
+                        f"{_MAX_LAYER_COMMENT} characters.",
                     )
                 opts["comment"] = item["comment"]
         else:
@@ -9485,29 +9646,36 @@ def main() -> None:
     - Starts the MCP server over stdio so tools (like get_data_stats) can be used.
     """
     import sys
-    
+
     # Log to stderr (visible in Claude Desktop logs)
     print("MITRE MCP Server starting...", file=sys.stderr)
     print(f"Data directory: {DATA_DIR}", file=sys.stderr)
-    
+
     # Check if we need to download
     existing = check_existing_data()
     if len(existing) < len(DOMAINS):
-        print(f"Downloading MITRE ATT&CK data (ATT&CK {release_info.LATEST_VERSION}, ATLAS {ATLAS_VERSION})...", file=sys.stderr)
+        print(
+            f"Downloading MITRE ATT&CK data (ATT&CK {release_info.LATEST_VERSION}, "
+            f"ATLAS {ATLAS_VERSION})...",
+            file=sys.stderr,
+        )
         downloaded = download_all_domains(force=False)
         print(f"Downloaded {len(downloaded)}/{len(DOMAINS)} domains", file=sys.stderr)
     else:
-        print(f"Using existing data (ATT&CK {release_info.LATEST_VERSION}, ATLAS {ATLAS_VERSION})", file=sys.stderr)
-    
+        print(
+            f"Using existing data (ATT&CK {release_info.LATEST_VERSION}, ATLAS {ATLAS_VERSION})",
+            file=sys.stderr,
+        )
+
     # Load domains into memory
     print("Loading domains into memory...", file=sys.stderr)
     loaded = load_all_domains()
     print(f"Loaded {len(loaded)} domains: {', '.join(loaded)}", file=sys.stderr)
-    
+
     print("Server ready!", file=sys.stderr)
-    
+
     # Start the MCP server over stdio (mcp 2.x requires an explicit transport)
     mcp.run(transport="stdio")
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover - script entry; main() is tested in test_main.py
     main()

@@ -5,11 +5,12 @@ import json
 import re
 
 import pytest
-from conftest import needs_atlas
-from mitre_mcp_server import server
+from conftest import needs_atlas, require_domain
 from mitreattack import release_info
 from mitreattack.navlayers import Layer
 from mitreattack.navlayers.core.layerobj import _LayerObj
+
+from mitre_mcp_server import server
 
 
 def _assert_valid_attack_layer(layer, capsys):
@@ -115,10 +116,7 @@ async def test_duplicates_warn():
 
 @pytest.mark.parametrize("domain", ["mobile", "ics"])
 async def test_other_domains(domain, capsys):
-    try:
-        data = server.get_attack_data(domain)
-    except FileNotFoundError:
-        pytest.skip(f"{domain} cache missing")
+    data = require_domain(domain)
     tech = data.get_techniques(include_subtechniques=False, remove_revoked_deprecated=True)[0]
     aid = data.get_attack_id(tech["id"])
     res = await server.generate_technique_layer([aid], domain=domain)
@@ -230,3 +228,15 @@ async def test_generate_layer_save(tmp_path, monkeypatch):
     res = await server.generate_layer("M1036", save_to_file=True)
     assert res["layer"] is None
     assert json.loads(open(res["layer_path"]).read())["domain"] == "enterprise-attack"
+
+
+async def test_layer_tools_report_save_failures(tmp_path, monkeypatch):
+    require_domain("enterprise")
+    blocker = tmp_path / "file"
+    blocker.write_text("")
+    monkeypatch.setattr(server, "LAYER_DIR", blocker / "layers")
+    result = await server.generate_technique_layer(["T1059"], save_to_file=True)
+    assert result["success"] is False and "Could not write layer file" in result["message"]
+    assert result["layer_path"] is None
+    result = await server.generate_layer("G0016", save_to_file=True)
+    assert result["success"] is False and "Could not write layer file" in result["message"]

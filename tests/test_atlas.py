@@ -1,8 +1,8 @@
 """Library-level ATLAS tests (subclass behaviour)."""
 
 from conftest import needs_atlas
-from mitre_mcp_server import server
 
+from mitre_mcp_server import server
 
 
 def _t0051(atlas):

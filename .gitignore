@@ -4,7 +4,10 @@ __pycache__/
 *.egg-info/
 .DS_Store
 .pytest_cache/
-uv.lock
 .mitre-mcp-server/
 .boost/
 .claude/
+.coverage
+.coverage.*
+htmlcov/
+.ruff_cache/

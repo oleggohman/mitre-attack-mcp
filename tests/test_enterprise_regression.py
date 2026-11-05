@@ -10,7 +10,9 @@ def test_subclass_matches_library_on_enterprise():
     plain = MitreAttackData(path)
     sub = server._MitreData(path)
 
-    ids = lambda objs: sorted(o["id"] for o in objs)  # noqa: E731
+    def ids(objs):
+        return sorted(o["id"] for o in objs)
+
     assert ids(plain.get_tactics()) == ids(sub.get_tactics())
     assert ids(plain.get_matrices()) == ids(sub.get_matrices())
 

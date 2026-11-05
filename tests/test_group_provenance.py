@@ -1,6 +1,7 @@
 """Group technique provenance: direct vs inherited through campaigns."""
 
 import pytest
+
 from mitre_mcp_server import server
 
 

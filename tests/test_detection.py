@@ -1,7 +1,8 @@
 """Detection strategy chain: technique -> DET -> analytic -> data component."""
 
 import pytest
-from conftest import needs_atlas
+from conftest import needs_atlas, require_domain
+
 from mitre_mcp_server import server
 
 
@@ -94,10 +95,7 @@ async def test_techniques_detected_by_datacomponent_chain():
 
 @pytest.mark.parametrize("domain", ["mobile", "ics"])
 async def test_other_domains_have_strategies(domain):
-    try:
-        data = server.get_attack_data(domain)
-    except FileNotFoundError:
-        pytest.skip(f"{domain} cache missing")
+    data = require_domain(domain)
     dets = data.get_detectionstrategies(remove_revoked_deprecated=True)
     assert dets
     for det in dets:
@@ -108,7 +106,7 @@ async def test_other_domains_have_strategies(domain):
             res = await server.get_detection_strategies_for_technique(aid, domain=domain)
             assert res["count"] >= 1
             return
-    pytest.skip("no technique with a detection strategy")
+    pytest.fail(f"raw data check: no technique in {domain} maps to a detection strategy")
 
 
 @needs_atlas

@@ -4,6 +4,7 @@ import math
 
 import pytest
 from conftest import needs_atlas
+
 from mitre_mcp_server import server
 
 META_KEYS = {"total", "returned", "offset", "limit", "has_more"}

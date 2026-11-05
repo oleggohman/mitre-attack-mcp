@@ -67,6 +67,8 @@ uv run pytest             # run the tests
 
 ATLAS tests are skipped when the ATLAS bundle is not available locally. Set `MITRE_MCP_REQUIRE_ATLAS=1` to make them fail instead of skip (useful in CI).
 
+See [TESTING.md](TESTING.md) for the full test procedure (suites, markers, coverage gate, CI).
+
 ### npm launcher (`run.js`)
 
 `package.json` and `run.js` are inherited from upstream. `run.js` starts the server by trying `uvx`, then `python3`, then `python` (the last two with `src/` on `PYTHONPATH` and the dependencies already installed). It moves to the next launcher only when a command is missing from `PATH`. If `uvx` is present but fails (for example offline on first install), or `python3` lacks the dependencies, it exits with that error and does not try the next one. The npm package `@imouiche/mitre-attack-mcp-server` belongs to upstream and is not published by this fork.
@@ -152,6 +154,7 @@ Tool names and arguments only; responses depend on the loaded ATLAS release.
 
 - ATLAS case studies are not included (they are not in the STIX bundle). ATLAS layers are not load-tested in the live ATLAS Navigator (see [Navigator layers](#navigator-layers)).
 - `get_procedure_examples_by_tactic` always returns 0 results: it calls a method that does not exist on the library and swallows the error. Use `get_procedure_examples_by_technique` meanwhile.
+- `get_group_by_name` / `get_group_techniques` resolve a partial query that matches several groups to the one with the lowest ATT&CK ID and list the candidates in `ambiguous_matches` (at most 10). An empty query matches nothing.
 - The ATLAS release is pinned and not auto-updated (see [Data sources](#data-sources)).
 - The first start needs network access to download the ATT&CK and ATLAS STIX data (see [First start downloads data](#first-start-downloads-data)).
 
@@ -212,7 +215,7 @@ Tool names and arguments only; responses depend on the loaded ATLAS release.
 
 | Tool | Description |
 |---|---|
-| `get_group_by_name` | Group by name or alias (case-insensitive) |
+| `get_group_by_name` | Group by name or alias (case-insensitive; `ambiguous_matches` when a partial query matches several) |
 | `search_groups` | Search groups by name, alias or description |
 | `get_all_groups` | All groups in a domain |
 | `get_groups_by_alias` | Groups matching an alias |
