@@ -9,50 +9,6 @@ branches from upstream
 [imouiche/complete-mitre-attack-mcp-server](https://github.com/imouiche/complete-mitre-attack-mcp-server)
 at commit `243169c`.
 
-## [Unreleased]
-
-### Added
-- Exhaustive tool smoke suite (every tool x domain, derived from the tool registry), cross-tool
-  invariants, stdio protocol tests, fault injection, representation/variant sweeps, a 100 % line
-  and branch coverage gate, a GitHub Actions workflow and ruff linting. See `TESTING.md`.
-
-### Fixed
-- `get_all_subtechniques(remove_revoked_deprecated=False)` omitted revoked subtechniques (16 in
-  ATT&CK v20.0 enterprise) because they have lost their `subtechnique-of` relationship. They are
-  now listed with `parent_attack_id`, `parent_name` and `parent_stix_id` set to null. The default
-  call is unchanged.
-- `get_datacomponents_detecting_technique`, `get_tactics_by_matrix` and `get_tactics_by_technique`
-  now publish an outputSchema and return a structured result (they lacked a usable return
-  annotation).
-- `get_revoked_techniques` (and `get_attack_id`) returned `id: null` for revoked mobile
-  techniques whose only external reference uses the legacy `mitre-mobile-attack` source name;
-  legacy `mitre-mobile-attack` and `mitre-ics-attack` sources are now recognised.
-- `get_stats` reported zero counts with a normal message when a data lookup failed. It now returns
-  `success: false`, `null` for the failed counts and a message naming the error (`success: true`
-  is added to normal responses).
-- `get_techniques_used_by_group_software` ignored software that a group only uses through
-  attributed campaigns, so it disagreed with `get_software_used_by_group` (G1015: 120 vs 125
-  techniques). New `include_campaigns` parameter (default true, same semantics as the group
-  tools); `false` restores the direct-only set.
-- `get_subtechniques_of_technique` and `get_techniques_mitigated_by_mitigation` raised a tool
-  error for an unknown STIX ID; they now return an empty result (`count` 0) with a "not found"
-  message like the other lookups.
-- `get_group_by_name` and `get_group_techniques` returned the first group whose name or alias
-  merely contained the query (for example "APT1" resolved to APT17, "APT3" to APT38). An exact
-  name match now wins over an exact alias match, which wins over a partial match.
-- `get_group_by_name` and `get_group_techniques` matched every group for an empty or
-  whitespace-only query (returning APT38). An empty query now matches nothing. When a partial
-  query matches several groups, the group with the lowest ATT&CK ID is still returned, and the
-  response adds `ambiguous_matches` (ATT&CK IDs, at most 10) and says so in the message.
-- `get_techniques_used_by_group_software` with `include_campaigns=true` returned no techniques at
-  all when the lookup for one software failed. The failing software is now skipped and named in a
-  new `warnings` list.
-
-### Known issues
-- `get_procedure_examples_by_tactic` is broken: it always returns 0 results because it calls a
-  method that does not exist on the library and swallows the error (use
-  `get_procedure_examples_by_technique`). Tracked as a known bug in the test suite.
-
 ## [0.4.0] - 2026-11-05
 
 ### Breaking
@@ -112,6 +68,10 @@ at commit `243169c`.
 - `include_relationships`, `include_campaigns`, `include_comments` and `save_to_file`
   parameters; `MITRE_MCP_LAYER_DIR` (default `~/.mitre-mcp-server/layers`) for saved layers.
 
+- Exhaustive tool smoke suite (every tool x domain, derived from the tool registry), cross-tool
+  invariants, stdio protocol tests, fault injection, representation/variant sweeps, a 100 % line
+  and branch coverage gate, a GitHub Actions workflow and ruff linting. See `TESTING.md`.
+
 ### Fixed
 - `get_techniques_used_by_group_software` always returned 0 techniques.
 - `get_technique_by_id` ignored `include_description=False`; the same for the 120-character
@@ -120,6 +80,41 @@ at commit `243169c`.
 - `generate_layer` `D` prefix never matched a real ID; data components are `DC####`.
 - `get_layer_metadata` hard-coded ATT&CK version 16; it now reports the bundled release.
 - Layer tools no longer print navlayers warnings to stdout (the MCP stream).
+- `get_all_subtechniques(remove_revoked_deprecated=False)` omitted revoked subtechniques (16 in
+  ATT&CK v20.0 enterprise) because they have lost their `subtechnique-of` relationship. They are
+  now listed with `parent_attack_id`, `parent_name` and `parent_stix_id` set to null. The default
+  call is unchanged.
+- `get_datacomponents_detecting_technique`, `get_tactics_by_matrix` and `get_tactics_by_technique`
+  now publish an outputSchema and return a structured result (they lacked a usable return
+  annotation).
+- `get_revoked_techniques` (and `get_attack_id`) returned `id: null` for revoked mobile
+  techniques whose only external reference uses the legacy `mitre-mobile-attack` source name;
+  legacy `mitre-mobile-attack` and `mitre-ics-attack` sources are now recognised.
+- `get_stats` reported zero counts with a normal message when a data lookup failed. It now returns
+  `success: false`, `null` for the failed counts and a message naming the error (`success: true`
+  is added to normal responses).
+- `get_techniques_used_by_group_software` ignored software that a group only uses through
+  attributed campaigns, so it disagreed with `get_software_used_by_group` (G1015: 120 vs 125
+  techniques). New `include_campaigns` parameter (default true, same semantics as the group
+  tools); `false` restores the direct-only set.
+- `get_subtechniques_of_technique` and `get_techniques_mitigated_by_mitigation` raised a tool
+  error for an unknown STIX ID; they now return an empty result (`count` 0) with a "not found"
+  message like the other lookups.
+- `get_group_by_name` and `get_group_techniques` returned the first group whose name or alias
+  merely contained the query (for example "APT1" resolved to APT17, "APT3" to APT38). An exact
+  name match now wins over an exact alias match, which wins over a partial match.
+- `get_group_by_name` and `get_group_techniques` matched every group for an empty or
+  whitespace-only query (returning APT38). An empty query now matches nothing. When a partial
+  query matches several groups, the group with the lowest ATT&CK ID is still returned, and the
+  response adds `ambiguous_matches` (ATT&CK IDs, at most 10) and says so in the message.
+- `get_techniques_used_by_group_software` with `include_campaigns=true` returned no techniques at
+  all when the lookup for one software failed. The failing software is now skipped and named in a
+  new `warnings` list.
+
+### Known issues
+- `get_procedure_examples_by_tactic` is broken: it always returns 0 results because it calls a
+  method that does not exist on the library and swallows the error (use
+  `get_procedure_examples_by_technique`). Tracked as a known bug in the test suite.
 
 ## [0.3.0] - 2026-11-03
 
